@@ -156,9 +156,16 @@ async function handleEvent(event) {
   const userId = event.source.userId;
   const userName = await getUserName(event);
 
-  // 取得我的 User ID（用來設定第一位管理員）
-  if (text === '我的ID' || text === '我的id') {
-    return reply(event, `👤 你的 User ID：\n${userId}\n\n（請複製這串，部署時可設為管理員）`);
+  // 取得 ID 資訊（User ID + 群組ID）
+  if (text === '我的ID' || text === '我的id' || text === '群組ID' || text === '群組id') {
+    const gid = event.source.groupId || event.source.roomId;
+    let msg = `👤 你的 User ID：\n${userId}`;
+    if (gid) {
+      msg += `\n\n👥 群組 ID：\n${gid}\n\n📌 請把上方「群組ID」複製\n到 Render → Environment 新增：\nKey: LINE_GROUP_ID\nValue: ${gid}`;
+    } else {
+      msg += `\n\n（請複製此ID，部署時可設為管理員）`;
+    }
+    return reply(event, msg);
   }
 
   const parts = text.split(/\s+/);
