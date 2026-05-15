@@ -32,6 +32,26 @@ const FIELD_LABEL = {
   address: '地址', site_acc: '帳號', site_pwd: '密碼', note: '備註'
 };
 
+// ====== GitHub 備份初始化 ======
+let octokit = null;
+try {
+  const { Octokit } = require('@octokit/rest');
+  if (process.env.GITHUB_TOKEN) {
+    octokit = new Octokit({ auth: process.env.GITHUB_TOKEN });
+    console.log('✅ GitHub 備份模組已載入');
+  } else {
+    console.log('⚠️ 未設定 GITHUB_TOKEN，備份功能停用');
+  }
+} catch(e) {
+  console.log('⚠️ Octokit 模組載入失敗:', e.message);
+}
+const GH_OWNER = process.env.GITHUB_OWNER || '';
+const GH_REPO = process.env.GITHUB_REPO || 'line-ticket-bot';
+const BK_BRANCH = 'data';
+const BK_TABLES = ['shows', 'orders', 'realname', 'allocations', 'payments', 'blacklist', 'whitelist', 'admins'];
+let backupTimer = null;
+let lastBackupTime = null;
+
 function initDB() {
   db.exec(`
     CREATE TABLE IF NOT EXISTS shows (
@@ -92,6 +112,101 @@ function initDB() {
   }
 }
 
+// ====== GitHub 備份函式 ======
+async function ensureBackupBranch() {
+  if (!octokit || !GH_OWNER) return false;
+  try {
+    await octokit.repos.getBranch({ owner: GH_OWNER, repo: GH_REPO, branch: BK_BRANCH });
+    return true;
+  } catch(e) {
+    if (e.status === 404) {
+      try {
+        const { data: main } = await octokit.repos.getBranch({ owner: GH_OWNER, repo: GH_REPO, branch: 'main' });
+        await octokit.git.createRef({ owner: GH_OWNER, repo: GH_REPO, ref: `refs/heads/${BK_BRANCH}`, sha: main.commit.sha });
+        console.log(`✅ 已建立 GitHub 備份分支「${BK_BRANCH}」`);
+        return true;
+      } catch(e2) { console.error('建立備份分支失敗:', e2.message); return false; }
+    }
+    console.error('檢查分支失敗:', e.message);
+    return false;
+  }
+}
+
+async function pushFileToGithub(path, content) {
+  const contentStr = typeof content === 'string' ? content : JSON.stringify(content, null, 2);
+  const contentBase64 = Buffer.from(contentStr, 'utf-8').toString('base64');
+  let sha;
+  try {
+    const { data } = await octokit.repos.getContent({ owner: GH_OWNER, repo: GH_REPO, path, ref: BK_BRANCH });
+    sha = data.sha;
+  } catch(e) {}
+  await octokit.repos.createOrUpdateFileContents({
+    owner: GH_OWNER, repo: GH_REPO, path,
+    message: `Auto backup ${path} (${new Date().toISOString()})`,
+    content: contentBase64, branch: BK_BRANCH, sha
+  });
+}
+
+async function performBackup() {
+  if (!octokit || !GH_OWNER) return false;
+  try {
+    if (!(await ensureBackupBranch())) return false;
+    const snapshot = { updated_at: new Date().toISOString(), version: '2.0' };
+    for (const table of BK_TABLES) {
+      try { snapshot[table] = db.prepare(`SELECT * FROM ${table}`).all(); }
+      catch(e) { console.error(`讀取 ${table} 失敗:`, e.message); snapshot[table] = []; }
+    }
+    await pushFileToGithub('data/snapshot.json', snapshot);
+    // 額外為每個資料表存獨立檔（方便閱讀）
+    for (const table of BK_TABLES) {
+      if (snapshot[table].length > 0) {
+        await pushFileToGithub(`data/${table}.json`, snapshot[table]).catch(e=>console.error(`備份 ${table}:`, e.message));
+      }
+    }
+    lastBackupTime = snapshot.updated_at;
+    console.log(`✅ 備份完成 ${lastBackupTime}`);
+    return true;
+  } catch(e) {
+    console.error('備份失敗:', e.message);
+    return false;
+  }
+}
+
+function scheduleBackup() {
+  if (!octokit || !GH_OWNER) return;
+  if (backupTimer) clearTimeout(backupTimer);
+  backupTimer = setTimeout(() => performBackup().catch(console.error), 15000);
+}
+
+async function restoreFromBackup() {
+  if (!octokit || !GH_OWNER) { console.log('ℹ️ 未設定 GitHub，跳過還原'); return; }
+  try {
+    if (!(await ensureBackupBranch())) return;
+    const { data } = await octokit.repos.getContent({
+      owner: GH_OWNER, repo: GH_REPO, path: 'data/snapshot.json', ref: BK_BRANCH
+    });
+    const snapshot = JSON.parse(Buffer.from(data.content, 'base64').toString('utf-8'));
+    let total = 0;
+    for (const table of BK_TABLES) {
+      if (!snapshot[table] || snapshot[table].length === 0) continue;
+      const count = db.prepare(`SELECT COUNT(*) c FROM ${table}`).get().c;
+      if (count > 0) continue; // 本地已有資料，不覆蓋
+      const rows = snapshot[table];
+      const keys = Object.keys(rows[0]);
+      const stmt = db.prepare(`INSERT INTO ${table} (${keys.join(',')}) VALUES (${keys.map(()=>'?').join(',')})`);
+      for (const row of rows) {
+        try { stmt.run(...keys.map(k => row[k] === undefined ? null : row[k])); total++; }
+        catch(e) { console.error(`還原 ${table}:`, e.message); }
+      }
+    }
+    if (total > 0) console.log(`✅ 已從 GitHub 還原 ${total} 筆紀錄（備份於 ${snapshot.updated_at}）`);
+    else console.log('ℹ️ 無需還原（本地已有資料或備份為空）');
+  } catch(e) {
+    if (e.status === 404) console.log('ℹ️ GitHub 沒有備份檔（第一次運行）');
+    else console.error('還原失敗:', e.message);
+  }
+}
+
 // ====== Helpers ======
 function isAdmin(uid) {
   const c = db.prepare('SELECT COUNT(*) c FROM admins').get().c;
@@ -106,10 +221,7 @@ function dDiff(a, b) { const x = new Date(a); x.setHours(0,0,0,0); const y = new
 const tName = r => ['最高票價區','次高票價區','第三票價區','第四票價區'][r-1] || '其餘票價區';
 const tRank = n => { const i = ['最高票價區','次高票價區','第三票價區','第四票價區'].indexOf(n); return i===-1?5:i+1; };
 const defCap = r => DEFAULT_CAPS[r] || CAP_OTHER;
-function calcFee(r, t) {
-  if (t>=10) return r<=2?2500:r<=4?2000:1500;
-  return r<=2?2000:1000;
-}
+function calcFee(r, t) { if (t>=10) return r<=2?2500:r<=4?2000:1500; return r<=2?2000:1000; }
 function ntStr(n) { return '$' + Number(n).toLocaleString(); }
 
 async function dispName(e) {
@@ -131,10 +243,9 @@ async function pushGroupMention(intro, members, gOverride) {
     mentions.push({ type:'user', index:text.length, length:tag.length, userId:m.userId });
     text += `${tag} ${m.note}\n`;
   }
-  return client.pushMessage(g, { type:'text', text:text.substring(0,4999), mentions }).catch(e=>console.error('pushGroupMention:',e.message));
+  return client.pushMessage(g, { type:'text', text:text.substring(0,4999), mentions }).catch(e=>console.error('mention:',e.message));
 }
 
-// ====== URL 票價偵測 ======
 async function detectPrices(url) {
   try {
     const res = await fetch(url, {
@@ -146,10 +257,8 @@ async function detectPrices(url) {
     const raw = html.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&');
     const found = new Set();
     const patterns = [
-      /NT\$\s*(\d{1,3}(?:,\d{3})+)/g,
-      /NT\$\s*(\d{4,5})\b/g,
-      /\$\s*(\d{1,3}(?:,\d{3})+)/g,
-      /票價[：:]\s*(\d{1,3}(?:,\d{3})*)/g,
+      /NT\$\s*(\d{1,3}(?:,\d{3})+)/g, /NT\$\s*(\d{4,5})\b/g,
+      /\$\s*(\d{1,3}(?:,\d{3})+)/g, /票價[：:]\s*(\d{1,3}(?:,\d{3})*)/g,
       /(\d{1,3}(?:,\d{3})+)\s*元/g,
     ];
     for (const p of patterns) {
@@ -160,23 +269,16 @@ async function detectPrices(url) {
       }
     }
     return found.size > 0 ? [...found].sort((a,b) => b-a) : null;
-  } catch(e) {
-    console.error('detectPrices:', e.message);
-    return null;
-  }
+  } catch(e) { console.error('detectPrices:', e.message); return null; }
 }
 
-// ====== 實名欄位解析 ======
 function parseFields(lines) {
   const data = {};
   for (const line of lines) {
     const t = line.trim();
     if (!t) continue;
     const m = t.match(/^([^\s:：=]+)[\s:：=]+(.+)$/);
-    if (m) {
-      const fkey = FIELDS[m[1].trim()];
-      if (fkey) data[fkey] = m[2].trim();
-    }
+    if (m) { const fkey = FIELDS[m[1].trim()]; if (fkey) data[fkey] = m[2].trim(); }
   }
   return data;
 }
@@ -204,7 +306,6 @@ async function handleEvent(event) {
 
   try {
     switch(cmd) {
-      // 成員指令
       case '下單': return cmdOrder(event, parts.slice(1), uid, userName);
       case '我的訂單': case '查訂單': return cmdMyOrders(event, uid, userName, inGrp);
       case '取消訂單': return cmdCancel(event, parts.slice(1), uid);
@@ -223,7 +324,7 @@ async function handleEvent(event) {
       case '規章': return reply(event, txtRules());
       case '流程': return reply(event, txtProcess());
       case '申請異議': return cmdDispute(event, parts.slice(1), uid, userName);
-      // 管理員指令
+      // 管理員
       case '上場次': return cmdUrlShow(event, parts.slice(1), uid);
       case '新增場次': return cmdAddShow(event, parts.slice(1), uid);
       case '改場次名稱': return cmdRenameShow(event, parts.slice(1), uid);
@@ -247,16 +348,15 @@ async function handleEvent(event) {
       case '功能更新': return cmdFeatureUpdate(event, parts.slice(1).join(' ') + (restLines.length?'\n'+restLines.join('\n'):''), uid);
       case '新增管理員': return cmdAddAdmin(event, parts.slice(1), uid);
       case '管理員列表': return cmdListAdmins(event, uid);
+      case '立即備份': return cmdManualBackup(event, uid);
+      case '備份狀態': return cmdBackupStatus(event, uid);
       case '幫助': case '說明': case '指令': case 'help': return reply(event, txtHelp(admin));
       default: return null;
     }
-  } catch(e) {
-    console.error('Error:', e);
-    return reply(event, '❌ 系統錯誤，請稍後再試。');
-  }
+  } catch(e) { console.error('Error:', e); return reply(event, '❌ 系統錯誤，請稍後再試。'); }
 }
 
-// ====== 下單（含實名驗證、上限警告） ======
+// ====== 下單 ======
 async function cmdOrder(event, args, uid, userName) {
   if (args.length < 3) {
     const shows = db.prepare('SELECT * FROM shows ORDER BY show_date').all();
@@ -277,24 +377,17 @@ async function cmdOrder(event, args, uid, userName) {
     }
     return reply(event, msg + '\n\n範例：下單 1 7880 2');
   }
-
-  const showId = parseInt(args[0]);
-  const price = parseInt(args[1]);
-  const qty = parseInt(args[2]);
+  const showId = parseInt(args[0]), price = parseInt(args[1]), qty = parseInt(args[2]);
   if (isNaN(showId)||isNaN(price)||isNaN(qty)) return reply(event, '❌ 格式錯誤！\n範例：下單 1 7880 2');
   if (qty<=0 || qty>20) return reply(event, '❌ 張數須在 1-20 之間。');
-
   const show = db.prepare('SELECT * FROM shows WHERE id=?').get(showId);
   if (!show) return reply(event, `❌ 找不到場次 ${showId}。`);
-
   const tiers = JSON.parse(show.price_tiers);
-  if (!tiers.includes(price)) return reply(event, `❌ ${ntStr(price)} 不在此場次票價中。\n可選：${tiers.map(t=>ntStr(t)).join('、')}`);
-
+  if (!tiers.includes(price)) return reply(event, `❌ ${ntStr(price)} 不在票價中。\n可選：${tiers.map(t=>ntStr(t)).join('、')}`);
   const days = dDiff(today(), show.ticket_sale_date);
   if (days<0) return reply(event, `⛔ 此場次搶票日已過。`);
   if (days<=3) return reply(event, `⛔ 【訂單不受理】\n距「${show.name}」搶票日僅 ${days} 天，已停止收單。\n如有特殊情況請私訊管理員。`);
 
-  // 實名制驗證
   if (show.is_real_name) {
     const req = JSON.parse(show.required_fields || '[]');
     const tpa = show.tickets_per_account || 1;
@@ -304,9 +397,9 @@ async function cmdOrder(event, args, uid, userName) {
     const needTotal = existQty + qty;
     if (needTotal > maxAllowed) {
       const shortAcc = Math.ceil(needTotal/tpa) - accs.length;
-      let m = `⛔ 【實名資料不足，無法下單】\n\n「${show.name}」為實名制\n每帳號限購 ${tpa} 張\n\n您在 ${ntStr(price)} 已提供：${accs.length} 個帳號（可購 ${maxAllowed} 張）\n本次想訂 ${qty} 張`;
+      let m = `⛔ 【實名資料不足，無法下單】\n\n「${show.name}」為實名制\n每帳號限購 ${tpa} 張\n\n${ntStr(price)} 已提供：${accs.length} 個帳號（可購 ${maxAllowed} 張）\n本次想訂 ${qty} 張`;
       if (existQty>0) m += `（含已訂 ${existQty} 張）`;
-      m += `\n\n還需提供 ${shortAcc} 個帳號的實名資料。\n\n填寫格式（多行訊息）：\n實名 ${showId} ${price}\n姓名 王小明`;
+      m += `\n\n還需提供 ${shortAcc} 個帳號的實名資料\n\n填寫格式（多行訊息）：\n實名 ${showId} ${price}\n姓名 王小明`;
       req.forEach(f => { if (f !== 'name') m += `\n${FIELD_LABEL[f]} （請填）`; });
       return reply(event, m);
     }
@@ -320,27 +413,17 @@ async function cmdOrder(event, args, uid, userName) {
   const newTotal = tierTotal + qty;
   const seqMax = db.prepare('SELECT MAX(order_seq) s FROM orders WHERE show_id=? AND ticket_price=?').get(showId,price).s || 0;
   const seq = seqMax + 1;
-
-  db.prepare('INSERT INTO orders (show_id,member_id,member_name,price_tier,ticket_price,quantity,order_seq) VALUES (?,?,?,?,?,?,?)')
-    .run(showId, uid, userName, tier, price, qty, seq);
-
-  const memTotal = db.prepare('SELECT SUM(quantity) t FROM orders WHERE show_id=? AND member_id=? AND status!="cancelled"').get(showId,uid).t || 0;
+  db.prepare('INSERT INTO orders (show_id,member_id,member_name,price_tier,ticket_price,quantity,order_seq) VALUES (?,?,?,?,?,?,?)').run(showId, uid, userName, tier, price, qty, seq);
   let msg = `✅ 訂單登記成功\n\n👤 ${userName}\n🎵 ${show.name}\n💰 ${ntStr(price)}（${tier}）\n🎫 ${qty} 張\n📊 下單序號：第${seq}筆\n📦 此票價區累計：${newTotal}/${cap}張`;
-
   if (newTotal > cap) {
-    msg += `\n\n⚠️ 【注意】此票價區已超過建議上限 ${newTotal-cap} 張\n目前去票區張數較多，如再下單不一定能完整拿到所下單的數量\n將依下單順序配票\n\n📋 ${ntStr(price)} 下單順序：`;
+    msg += `\n\n⚠️ 【注意】此票價區已超過上限 ${newTotal-cap} 張\n目前去票區張數較多，若再下單不一定能完整拿到\n將依下單順序配票\n\n📋 ${ntStr(price)} 下單順序：`;
     const queue = db.prepare('SELECT member_name, SUM(quantity) qty, MIN(order_seq) seq FROM orders WHERE show_id=? AND ticket_price=? AND status!="cancelled" GROUP BY member_id ORDER BY seq').all(showId, price);
     queue.forEach((q,i) => msg += `\n${i+1}. ${q.member_name}：${q.qty}張`);
-  } else if (newTotal >= cap * 0.85) {
-    msg += `\n⚡ 快滿額了！剩 ${cap - newTotal} 張`;
-  }
-
-  msg += `\n\n💵 票面合計 ${ntStr(price*qty)}`;
-  msg += `\n如需取消：取消訂單 ${showId}`;
+  } else if (newTotal >= cap * 0.85) msg += `\n⚡ 快滿額了！剩 ${cap - newTotal} 張`;
+  msg += `\n\n💵 票面合計 ${ntStr(price*qty)}\n如需取消：取消訂單 ${showId}`;
   return reply(event, msg);
 }
 
-// ====== 我的訂單（只顯示票面，不顯示行政費） ======
 async function cmdMyOrders(event, uid, userName, inGrp) {
   const orders = db.prepare(`SELECT o.*, s.name sn, s.show_date sd, s.ticket_sale_date td
     FROM orders o JOIN shows s ON o.show_id=s.id
@@ -362,11 +445,10 @@ async function cmdMyOrders(event, uid, userName, inGrp) {
     s.items.forEach(o => msg += `\n  • ${ntStr(o.ticket_price)} × ${o.quantity}張（第${o.order_seq}筆）`);
     msg += `\n📦 合計 ${total}張 ｜ 票面 ${ntStr(face)}`;
   }
-  msg += '\n\n💡 私訊Bot打「我的明細 [場次編號]」可查詳細費用（含行政費）';
+  msg += '\n\n💡 私訊Bot打「我的明細 [場次編號]」可查含行政費';
   return reply(event, msg);
 }
 
-// ====== 取消訂單 ======
 async function cmdCancel(event, args, uid) {
   if (args.length < 1) return reply(event, '格式：取消訂單 [場次編號]');
   const showId = parseInt(args[0]);
@@ -380,7 +462,6 @@ async function cmdCancel(event, args, uid) {
   return reply(event, `✅ 已取消「${show.name}」共 ${total}張訂單。`);
 }
 
-// ====== 場次統計 ======
 async function cmdStats(event, args) {
   let shows;
   if (args.length>0 && !isNaN(parseInt(args[0]))) shows = db.prepare('SELECT * FROM shows WHERE id=?').all(parseInt(args[0]));
@@ -405,8 +486,7 @@ async function cmdStats(event, args) {
     });
     msg += '\n\n💰 各票價：';
     tiers.forEach((p,i) => {
-      const d = byPrice[p];
-      if (!d) return;
+      const d = byPrice[p]; if (!d) return;
       const cap = caps[p] || defCap(i+1);
       const over = d.total > cap ? ' ⚠️超額' : '';
       msg += `\n\n[${ntStr(p)}] ${d.total}/${cap}張${over}`;
@@ -420,7 +500,6 @@ async function cmdStats(event, args) {
   return reply(event, msg);
 }
 
-// ====== 場次列表 ======
 async function cmdListShows(event) {
   const shows = db.prepare('SELECT * FROM shows ORDER BY show_date').all();
   if (shows.length === 0) return reply(event, '📭 目前沒有場次。');
@@ -443,7 +522,6 @@ async function cmdListShows(event) {
   return reply(event, msg);
 }
 
-// ====== 行政費試算 ======
 async function cmdFee(event, args) {
   if (args.length<2) return reply(event, '格式：行政費 [票價] [張數]\n範例：行政費 7880 8');
   const p = parseInt(args[0]), q = parseInt(args[1]);
@@ -454,7 +532,6 @@ async function cmdFee(event, args) {
   return reply(event, `💰 【行政費試算】\n票價：${ntStr(p)} × ${q}張\n${q>=10?'✅ 常態費率':'⚠️ 優惠費率'}\n\n票面：${ntStr(face)}\n行政費：${ntStr(fee)}/張 × ${q} = ${ntStr(ft)}\n────\n預估總額 ${ntStr(face+ft)}`);
 }
 
-// ====== 私密：我的明細（行政費） ======
 async function cmdMyDetail(event, args, uid, userName, inGrp) {
   if (args.length<1) return reply(event, '格式：我的明細 [場次編號]');
   const showId = parseInt(args[0]);
@@ -482,7 +559,6 @@ async function cmdMyDetail(event, args, uid, userName, inGrp) {
   return reply(event, msg);
 }
 
-// ====== 私密：我的配票 ======
 async function cmdMyAlloc(event, args, uid, userName, inGrp) {
   if (args.length<1) return reply(event, '格式：我的配票 [場次編號]');
   const showId = parseInt(args[0]);
@@ -505,21 +581,19 @@ async function cmdMyAlloc(event, args, uid, userName, inGrp) {
   return reply(event, msg);
 }
 
-// ====== 實名：成員提交 ======
 async function cmdSubmitRN(event, args, restLines, uid, userName, inGrp) {
   if (args.length<2) return reply(event, '📝 實名提交格式（多行訊息）：\n實名 [場次ID] [票價]\n姓名 王小明\n身分證 A123456789\n電話 0912345678\n帳號 abc\n密碼 xxx\n\n（依該場次要求欄位填寫）');
-  const showId = parseInt(args[0]);
-  const price = parseInt(args[1]);
+  const showId = parseInt(args[0]), price = parseInt(args[1]);
   const show = db.prepare('SELECT * FROM shows WHERE id=?').get(showId);
   if (!show) return reply(event, `❌ 找不到場次 ${showId}。`);
-  if (!show.is_real_name) return reply(event, `📌 「${show.name}」非實名制，無需提交實名資料。`);
+  if (!show.is_real_name) return reply(event, `📌 「${show.name}」非實名制，無需提交。`);
   const tiers = JSON.parse(show.price_tiers);
-  if (!tiers.includes(price)) return reply(event, `❌ ${ntStr(price)} 不在此場次票價內。`);
+  if (!tiers.includes(price)) return reply(event, `❌ ${ntStr(price)} 不在票價內。`);
   const required = JSON.parse(show.required_fields || '[]');
   const data = parseFields(restLines);
   const missing = required.filter(f => !data[f] || data[f].trim()==='');
   if (missing.length > 0) {
-    let m = `⛔ 缺少必填欄位：${missing.map(f=>FIELD_LABEL[f]).join('、')}\n\n請補齊後重新送出。範例：\n實名 ${showId} ${price}`;
+    let m = `⛔ 缺少必填欄位：${missing.map(f=>FIELD_LABEL[f]).join('、')}\n\n範例：\n實名 ${showId} ${price}`;
     required.forEach(f => m += `\n${FIELD_LABEL[f]} 請填寫`);
     return reply(event, m);
   }
@@ -527,16 +601,14 @@ async function cmdSubmitRN(event, args, restLines, uid, userName, inGrp) {
     .run(showId, uid, userName, price, data.name||null, data.id_no||null, data.phone||null, data.birthday||null, data.address||null, data.site_acc||null, data.site_pwd||null, data.note||null);
   const count = db.prepare('SELECT COUNT(*) c FROM realname WHERE show_id=? AND member_id=? AND ticket_price=?').get(showId, uid, price).c;
   const tpa = show.tickets_per_account || 1;
-  const maxTickets = count * tpa;
-  let msg = `✅ 實名資料已提交\n\n${userName}｜${show.name}\n${ntStr(price)} 票價區｜第 ${count} 個帳號`;
+  let msg = `✅ 實名資料已提交\n\n${userName}｜${show.name}\n${ntStr(price)}｜第 ${count} 個帳號`;
   required.forEach(f => { if (data[f]) msg += `\n${FIELD_LABEL[f]}：${f==='site_pwd'?'****':data[f]}`; });
-  msg += `\n\n📊 目前可下單張數：${maxTickets}張（${count}帳號 × ${tpa}張）`;
-  msg += `\n如要刪除：刪除實名 ${showId} [編號]\n如要查詢：我的實名 ${showId}`;
-  if (inGrp) { await pushU(uid, msg); return reply(event, `✅ ${userName} 實名資料已收到（已私訊您詳細內容）`); }
+  msg += `\n\n📊 目前可下單張數：${count * tpa}張（${count}帳號 × ${tpa}張）`;
+  msg += `\n刪除：刪除實名 ${showId} [#號]\n查詢：我的實名 ${showId}`;
+  if (inGrp) { await pushU(uid, msg); return reply(event, `✅ ${userName} 實名資料已收到（已私訊您詳情）`); }
   return reply(event, msg);
 }
 
-// ====== 實名：成員查詢自己 ======
 async function cmdMyRN(event, args, uid, userName, inGrp) {
   if (args.length<1) return reply(event, '格式：我的實名 [場次編號]');
   const showId = parseInt(args[0]);
@@ -547,12 +619,9 @@ async function cmdMyRN(event, args, uid, userName, inGrp) {
   const required = JSON.parse(show.required_fields || '[]');
   let msg = `📝 【${userName} 的實名】${show.name}`;
   const byPrice = {};
-  accs.forEach(a => {
-    if (!byPrice[a.ticket_price]) byPrice[a.ticket_price] = [];
-    byPrice[a.ticket_price].push(a);
-  });
+  accs.forEach(a => { if (!byPrice[a.ticket_price]) byPrice[a.ticket_price] = []; byPrice[a.ticket_price].push(a); });
   for (const [price, list] of Object.entries(byPrice)) {
-    msg += `\n\n💰 ${ntStr(price)} 票價區（${list.length}個帳號）：`;
+    msg += `\n\n💰 ${ntStr(price)}（${list.length}帳號）：`;
     list.forEach((a,i) => {
       msg += `\n\n#${a.id}（第${i+1}個）`;
       required.forEach(f => { if (a[f]) msg += `\n  ${FIELD_LABEL[f]}：${f==='site_pwd'?'****':a[f]}`; });
@@ -563,26 +632,23 @@ async function cmdMyRN(event, args, uid, userName, inGrp) {
   return reply(event, msg);
 }
 
-// ====== 實名：成員刪除 ======
 async function cmdDelRN(event, args, uid) {
-  if (args.length<2) return reply(event, '格式：刪除實名 [場次編號] [實名#號]\n（用「我的實名」可查 #號）');
-  const showId = parseInt(args[0]);
-  const rnId = parseInt(args[1]);
+  if (args.length<2) return reply(event, '格式：刪除實名 [場次ID] [實名#號]\n（用「我的實名」可查 #號）');
+  const showId = parseInt(args[0]), rnId = parseInt(args[1]);
   const r = db.prepare('SELECT * FROM realname WHERE id=? AND show_id=? AND member_id=?').get(rnId, showId, uid);
   if (!r) return reply(event, `❌ 找不到此實名記錄。`);
   db.prepare('DELETE FROM realname WHERE id=?').run(rnId);
-  return reply(event, `✅ 已刪除實名 #${rnId}（${ntStr(r.ticket_price)} 票價區）`);
+  return reply(event, `✅ 已刪除實名 #${rnId}（${ntStr(r.ticket_price)}）`);
 }
 
-// ====== 管理員：URL 新增場次 ======
 async function cmdUrlShow(event, args, uid) {
   if (!isAdmin(uid)) return reply(event, '❌ 此功能限管理員。');
-  if (args.length<4) return reply(event, '📝 格式：\n上場次 [售票URL] [演出日期] [搶票日] [地點]\n\n範例：\n上場次 https://kktix.com/xxx 2026-06-15 2026-05-01 台北小巨蛋\n\n系統會自動偵測票價並設定預設上限（最高30/次高36/其餘50）');
+  if (args.length<4) return reply(event, '📝 格式：\n上場次 [售票URL] [演出日期] [搶票日] [地點]\n\n範例：\n上場次 https://kktix.com/xxx 2026-06-15 2026-05-01 台北小巨蛋');
   const [url, sd, td, ...vp] = args;
   const venue = vp.join(' ');
   const prices = await detectPrices(url);
   if (!prices || prices.length === 0) {
-    return reply(event, `❌ 無法自動偵測票價\n\n可能原因：\n• 頁面需要 JavaScript 載入\n• 票價尚未公布\n• 網站有防爬機制\n\n請改用：\n新增場次 [名稱] ${sd} ${td} ${venue} [票價1,票價2,...]`);
+    return reply(event, `❌ 無法自動偵測票價\n\n可能原因：\n• 頁面需 JS 載入\n• 票價未公布\n• 防爬機制\n\n請改用：\n新增場次 [名稱] ${sd} ${td} ${venue} [票價1,票價2,...]`);
   }
   const urlName = url.replace(/^https?:\/\//,'').split('/')[1] || '未命名場次';
   const caps = {};
@@ -590,21 +656,19 @@ async function cmdUrlShow(event, args, uid) {
   const r = db.prepare('INSERT INTO shows (name, show_date, ticket_sale_date, venue, source_url, price_tiers, caps) VALUES (?,?,?,?,?,?,?)')
     .run(urlName, sd, td, venue, url, JSON.stringify(prices), JSON.stringify(caps));
   const showId = r.lastInsertRowid;
-  let adminMsg = `✅ 場次已建立 #${showId}\n\n名稱：${urlName}\n（如需改名：改場次名稱 ${showId} [新名稱]）\n演出：${fmtD(sd)}\n搶票日：${fmtD(td)}\n地點：${venue}\n\n💰 偵測到票價（自動設上限）：`;
+  let adminMsg = `✅ 場次已建立 #${showId}\n\n名稱：${urlName}\n（改名：改場次名稱 ${showId} [新名稱]）\n演出：${fmtD(sd)}\n搶票日：${fmtD(td)}\n地點：${venue}\n\n💰 偵測到票價：`;
   prices.forEach((p,i) => adminMsg += `\n  ${ntStr(p)}：上限${caps[p]}張`);
-  adminMsg += `\n\n🔧 如需設定實名制：\n設定實名 ${showId} [每帳號張數]\n設定實名欄位 ${showId} 姓名,身分證,電話,帳號,密碼`;
+  adminMsg += `\n\n🔧 如需實名制：\n設定實名 ${showId} 1\n設定實名欄位 ${showId} 姓名,身分證,電話,帳號,密碼`;
   await reply(event, adminMsg);
-  // 公告到群組
   let g = `🎵 【新場次開放下單】\n\n${urlName}\n📅 演出：${fmtD(sd)}\n🎫 搶票日：${fmtD(td)}\n📍 ${venue}\n\n💰 票價（總額上限）：`;
   prices.forEach(p => g += `\n  ${ntStr(p)}：上限${caps[p]}張`);
-  g += `\n\n✏️ 下單方式：\n下單 ${showId} [票價] [張數]\n\n📌 詳細場次：場次列表`;
+  g += `\n\n✏️ 下單：下單 ${showId} [票價] [張數]`;
   await pushG(g);
 }
 
-// ====== 管理員：手動新增場次 ======
 async function cmdAddShow(event, args, uid) {
   if (!isAdmin(uid)) return reply(event, '❌ 此功能限管理員。');
-  if (args.length<5) return reply(event, '📝 格式：\n新增場次 [名稱] [演出日期] [搶票日] [地點] [票價列表(逗號分隔)]\n\n範例：\n新增場次 aespa演唱會 2026-06-15 2026-05-01 台北小巨蛋 7880,6880,4880,3880,2880');
+  if (args.length<5) return reply(event, '📝 格式：\n新增場次 [名稱] [演出日期] [搶票日] [地點] [票價(逗號分隔)]\n\n範例：\n新增場次 aespa演唱會 2026-06-15 2026-05-01 台北小巨蛋 7880,6880,4880,3880,2880');
   const [name, sd, td, venue, pstr] = args;
   const prices = pstr.split(',').map(p=>parseInt(p.trim())).filter(p=>!isNaN(p)).sort((a,b)=>b-a);
   if (prices.length===0) return reply(event, '❌ 票價格式錯誤。');
@@ -613,9 +677,8 @@ async function cmdAddShow(event, args, uid) {
   const r = db.prepare('INSERT INTO shows (name, show_date, ticket_sale_date, venue, price_tiers, caps) VALUES (?,?,?,?,?,?)')
     .run(name, sd, td, venue, JSON.stringify(prices), JSON.stringify(caps));
   const showId = r.lastInsertRowid;
-  let adminMsg = `✅ 場次新增成功 #${showId}\n${name}\n演出：${fmtD(sd)}\n搶票日：${fmtD(td)}\n\n💰 票價及上限：`;
+  let adminMsg = `✅ 場次新增成功 #${showId}\n${name}\n演出：${fmtD(sd)}\n搶票日：${fmtD(td)}\n\n💰 票價：`;
   prices.forEach(p => adminMsg += `\n  ${ntStr(p)}：${caps[p]}張`);
-  adminMsg += `\n\n🔧 設定實名制（如需）：\n設定實名 ${showId} 1\n設定實名欄位 ${showId} 姓名,身分證,電話,帳號,密碼`;
   await reply(event, adminMsg);
   let g = `🎵 【新場次開放下單】\n\n${name}\n📅 演出：${fmtD(sd)}\n🎫 搶票日：${fmtD(td)}\n📍 ${venue}\n\n💰 票價：`;
   prices.forEach(p => g += `\n  ${ntStr(p)}：上限${caps[p]}張`);
@@ -623,7 +686,6 @@ async function cmdAddShow(event, args, uid) {
   await pushG(g);
 }
 
-// ====== 管理員：改場次名稱 ======
 async function cmdRenameShow(event, args, uid) {
   if (!isAdmin(uid)) return reply(event, '❌ 此功能限管理員。');
   if (args.length<2) return reply(event, '格式：改場次名稱 [場次ID] [新名稱]');
@@ -634,25 +696,22 @@ async function cmdRenameShow(event, args, uid) {
   const old = s.name;
   db.prepare('UPDATE shows SET name=? WHERE id=?').run(newName, showId);
   await reply(event, `✅ 已將「${old}」改名為「${newName}」`);
-  await pushG(`📌 【場次更名通知】\n#${showId} 已更名為：「${newName}」`);
+  await pushG(`📌 場次 #${showId} 更名為：「${newName}」`);
 }
 
-// ====== 管理員：設定實名 ======
 async function cmdSetRN(event, args, uid) {
   if (!isAdmin(uid)) return reply(event, '❌ 此功能限管理員。');
   if (args.length<1) return reply(event, '格式：設定實名 [場次ID] [每帳號可購張數(預設1)]\n例：設定實名 1 1');
-  const showId = parseInt(args[0]);
-  const tpa = parseInt(args[1] || '1');
+  const showId = parseInt(args[0]), tpa = parseInt(args[1] || '1');
   const s = db.prepare('SELECT * FROM shows WHERE id=?').get(showId);
   if (!s) return reply(event, `❌ 找不到場次。`);
   const defReq = JSON.parse(s.required_fields||'[]');
   const reqs = defReq.length>0 ? defReq : ['name','id_no','phone','site_acc','site_pwd'];
   db.prepare('UPDATE shows SET is_real_name=1, tickets_per_account=?, required_fields=? WHERE id=?').run(tpa, JSON.stringify(reqs), showId);
-  await reply(event, `✅ 已將「${s.name}」設為實名制\n每帳號可購 ${tpa} 張\n必填欄位：${reqs.map(f=>FIELD_LABEL[f]).join('、')}\n\n如需調整欄位：\n設定實名欄位 ${showId} [欄位1,欄位2,...]`);
-  await pushG(`📢 【實名制公告】\n\n「${s.name}」已設為實名制\n📋 每帳號可購：${tpa} 張\n📝 必填欄位：${reqs.map(f=>FIELD_LABEL[f]).join('、')}\n\n下單前請先提交實名資料：\n實名 ${showId} [票價]\n（多行訊息，依欄位填寫）\n\n查詢自己的實名：我的實名 ${showId}`);
+  await reply(event, `✅ 已設「${s.name}」為實名制\n每帳號可購 ${tpa} 張\n必填欄位：${reqs.map(f=>FIELD_LABEL[f]).join('、')}\n\n調整欄位：設定實名欄位 ${showId} [欄位列表]`);
+  await pushG(`📢 【實名制公告】\n\n「${s.name}」設為實名制\n📋 每帳號可購：${tpa} 張\n📝 必填欄位：${reqs.map(f=>FIELD_LABEL[f]).join('、')}\n\n下單前請先提交實名：\n實名 ${showId} [票價]\n（多行訊息，依欄位填寫）\n\n查詢自己：我的實名 ${showId}`);
 }
 
-// ====== 管理員：取消實名 ======
 async function cmdUnsetRN(event, args, uid) {
   if (!isAdmin(uid)) return reply(event, '❌ 此功能限管理員。');
   if (args.length<1) return reply(event, '格式：取消實名 [場次ID]');
@@ -661,46 +720,38 @@ async function cmdUnsetRN(event, args, uid) {
   if (!s) return reply(event, `❌ 找不到場次。`);
   db.prepare('UPDATE shows SET is_real_name=0 WHERE id=?').run(showId);
   await reply(event, `✅ 已取消「${s.name}」的實名制`);
-  await pushG(`📢 「${s.name}」已取消實名制限制`);
+  await pushG(`📢 「${s.name}」已取消實名制`);
 }
 
-// ====== 管理員：設定實名欄位 ======
 async function cmdSetFields(event, args, uid) {
   if (!isAdmin(uid)) return reply(event, '❌ 此功能限管理員。');
-  if (args.length<2) {
-    const opts = Object.keys(FIELD_LABEL).map(k => `${FIELD_LABEL[k]}`).join('、');
-    return reply(event, `格式：設定實名欄位 [場次ID] [欄位1,欄位2,...]\n\n可用欄位：${opts}\n\n例：\n設定實名欄位 1 姓名,身分證,電話,帳號,密碼`);
-  }
+  if (args.length<2) return reply(event, `格式：設定實名欄位 [場次ID] [欄位1,欄位2,...]\n\n可用欄位：${Object.keys(FIELD_LABEL).map(k=>FIELD_LABEL[k]).join('、')}\n\n例：\n設定實名欄位 1 姓名,身分證,電話,帳號,密碼`);
   const showId = parseInt(args[0]);
   const fstr = args[1];
   const s = db.prepare('SELECT * FROM shows WHERE id=?').get(showId);
   if (!s) return reply(event, `❌ 找不到場次。`);
   const reqs = fstr.split(',').map(f=>FIELDS[f.trim()]).filter(Boolean);
-  if (reqs.length===0) return reply(event, `❌ 沒有有效欄位。可用：${Object.keys(FIELDS).join('、')}`);
+  if (reqs.length===0) return reply(event, `❌ 無有效欄位。`);
   const unique = [...new Set(reqs)];
   db.prepare('UPDATE shows SET required_fields=? WHERE id=?').run(JSON.stringify(unique), showId);
-  await reply(event, `✅ 已更新「${s.name}」實名欄位：\n${unique.map(f=>FIELD_LABEL[f]).join('、')}`);
-  if (s.is_real_name) {
-    await pushG(`📢 【實名欄位更新】「${s.name}」\n必填欄位調整為：${unique.map(f=>FIELD_LABEL[f]).join('、')}\n\n提交格式：\n實名 ${showId} [票價]\n${unique.map(f=>FIELD_LABEL[f]+' 請填寫').join('\n')}`);
-  }
+  await reply(event, `✅ 已更新「${s.name}」實名欄位：${unique.map(f=>FIELD_LABEL[f]).join('、')}`);
+  if (s.is_real_name) await pushG(`📢 【實名欄位更新】「${s.name}」\n必填：${unique.map(f=>FIELD_LABEL[f]).join('、')}\n\n格式：\n實名 ${showId} [票價]\n${unique.map(f=>FIELD_LABEL[f]+' 請填寫').join('\n')}`);
 }
 
-// ====== 管理員：設定每帳號張數 ======
 async function cmdSetTPA(event, args, uid) {
   if (!isAdmin(uid)) return reply(event, '❌ 此功能限管理員。');
-  if (args.length<2) return reply(event, '格式：設定每帳號 [場次ID] [張數]\n例：設定每帳號 1 1');
+  if (args.length<2) return reply(event, '格式：設定每帳號 [場次ID] [張數]');
   const showId = parseInt(args[0]), tpa = parseInt(args[1]);
   const s = db.prepare('SELECT * FROM shows WHERE id=?').get(showId);
   if (!s) return reply(event, `❌ 找不到場次。`);
   db.prepare('UPDATE shows SET tickets_per_account=? WHERE id=?').run(tpa, showId);
-  await reply(event, `✅ 已將「${s.name}」設為每帳號可購 ${tpa} 張`);
+  await reply(event, `✅ 已設「${s.name}」每帳號可購 ${tpa} 張`);
   if (s.is_real_name) await pushG(`📌 「${s.name}」每帳號可購張數更新為 ${tpa} 張`);
 }
 
-// ====== 管理員：查實名 ======
 async function cmdViewRN(event, args, uid) {
   if (!isAdmin(uid)) return reply(event, '❌ 此功能限管理員。');
-  if (args.length<1) return reply(event, '格式：\n查實名 [場次ID] → 查全部\n查實名 [場次ID] [成員名] → 查特定');
+  if (args.length<1) return reply(event, '格式：\n查實名 [場次ID]\n查實名 [場次ID] [成員名]');
   const showId = parseInt(args[0]);
   const memberFilter = args.slice(1).join(' ');
   const s = db.prepare('SELECT * FROM shows WHERE id=?').get(showId);
@@ -722,7 +773,7 @@ async function cmdViewRN(event, args, uid) {
   for (const [key, items] of Object.entries(byMember)) {
     const [name, price] = key.split('|');
     msg += `\n\n👤 ${name}｜${ntStr(price)}（${items.length}帳號）`;
-    items.forEach((a,i) => {
+    items.forEach(a => {
       msg += `\n  #${a.id}：`;
       required.forEach(f => { if (a[f]) msg += `${FIELD_LABEL[f]}=${a[f]}｜`; });
     });
@@ -730,7 +781,6 @@ async function cmdViewRN(event, args, uid) {
   return reply(event, msg);
 }
 
-// ====== 管理員：設定上限 ======
 async function cmdSetCap(event, args, uid) {
   if (!isAdmin(uid)) return reply(event, '❌ 此功能限管理員。');
   if (args.length<3) return reply(event, '格式：設定上限 [場次ID] [票價] [新上限]');
@@ -743,7 +793,6 @@ async function cmdSetCap(event, args, uid) {
   await reply(event, `✅ 「${s.name}」${ntStr(p)} 上限設為 ${c} 張`);
 }
 
-// ====== 管理員：刪除場次 ======
 async function cmdDelShow(event, args, uid) {
   if (!isAdmin(uid)) return reply(event, '❌ 此功能限管理員。');
   if (args.length<1) return reply(event, '格式：刪除場次 [場次ID]');
@@ -754,11 +803,10 @@ async function cmdDelShow(event, args, uid) {
   db.prepare('DELETE FROM realname WHERE show_id=?').run(sid);
   db.prepare('DELETE FROM allocations WHERE show_id=?').run(sid);
   db.prepare('DELETE FROM shows WHERE id=?').run(sid);
-  await reply(event, `✅ 已刪除「${s.name}」及相關資料。`);
+  await reply(event, `✅ 已刪除「${s.name}」`);
   await pushG(`📌 「${s.name}」場次已取消`);
 }
 
-// ====== 管理員：發送確認 ======
 async function cmdSendConfirm(event, args, uid) {
   if (!isAdmin(uid)) return reply(event, '❌ 此功能限管理員。');
   if (args.length<1) return reply(event, '格式：發送確認 [場次ID]');
@@ -779,7 +827,6 @@ async function cmdSendConfirm(event, args, uid) {
   await reply(event, `✅ 已發送確認通知至群組，共 ${mems.length} 位成員`);
 }
 
-// ====== 管理員：開始配票 ======
 async function cmdStartAlloc(event, args, uid) {
   if (!isAdmin(uid)) return reply(event, '❌ 此功能限管理員。');
   if (args.length<1) return reply(event, '格式：開始配票 [場次ID]');
@@ -789,11 +836,10 @@ async function cmdStartAlloc(event, args, uid) {
   const orders = db.prepare('SELECT member_name, ticket_price, SUM(quantity) qty FROM orders WHERE show_id=? AND status!="cancelled" GROUP BY member_id, ticket_price ORDER BY ticket_price DESC, member_name').all(sid);
   let msg = `🎫 【配票模式】${s.name}\n\n訂單摘要：`;
   orders.forEach(o => msg += `\n${o.member_name} ${ntStr(o.ticket_price)} ${o.qty}張`);
-  msg += `\n\n配票指令：\n配票 ${sid} [成員名] [票價] [實拿張數]\n\n例：\n配票 ${sid} 小美 7880 2\n配票 ${sid} 小明 7880 0\n\n全部輸入完畢後：\n配票完成 ${sid}`;
+  msg += `\n\n配票指令：\n配票 ${sid} [成員名] [票價] [實拿張數]\n\n例：\n配票 ${sid} 小美 7880 2\n配票 ${sid} 小明 7880 0\n\n全部輸入完：配票完成 ${sid}`;
   return reply(event, msg);
 }
 
-// ====== 管理員：記錄配票 ======
 async function cmdRecordAlloc(event, args, uid) {
   if (!isAdmin(uid)) return reply(event, '❌ 此功能限管理員。');
   if (args.length<4) return reply(event, '格式：配票 [場次ID] [成員名] [票價] [實拿張數]');
@@ -815,7 +861,6 @@ async function cmdRecordAlloc(event, args, uid) {
   return reply(event, msg);
 }
 
-// ====== 管理員：配票完成 ======
 async function cmdFinishAlloc(event, args, uid) {
   if (!isAdmin(uid)) return reply(event, '❌ 此功能限管理員。');
   if (args.length<1) return reply(event, '格式：配票完成 [場次ID]');
@@ -833,12 +878,11 @@ async function cmdFinishAlloc(event, args, uid) {
     adminMsg += `\n\n💰 總退款：${ntStr(totalRefund)}`;
   } else adminMsg += `\n🎉 全數完整分配`;
   await reply(event, adminMsg);
-  let g = `🎫 【配票完成通知】\n\n「${s.name}」已完成配票\n\n請各成員私訊 Bot：\n我的配票 ${sid}\n\n即可查看您的配票結果及退款資訊。`;
+  let g = `🎫 【配票完成通知】\n\n「${s.name}」已完成配票\n\n請各成員私訊 Bot：\n我的配票 ${sid}\n\n即可查看配票結果及退款資訊。`;
   if (shorts.length>0) g += `\n\n⚠️ 本場次部分票區有缺票，請查詢確認。`;
   await pushG(g);
 }
 
-// ====== 黑/白名單 ======
 async function cmdCheckList(event, args, type) {
   if (args.length===0) return reply(event, `格式：查${type==='blacklist'?'黑':'白'}名單 [帳號]`);
   const acc = args.join(' ');
@@ -849,6 +893,7 @@ async function cmdCheckList(event, args, type) {
   r.forEach((x,i) => m += `\n${i+1}. ${x.account}\n   ${x.reason||'無備註'}`);
   return reply(event, m);
 }
+
 async function cmdAddList(event, args, uid, userName, type) {
   if (!isAdmin(uid)) return reply(event, '❌ 此功能限管理員。');
   if (args.length<2) return reply(event, `格式：加${type==='blacklist'?'黑':'白'}名單 [帳號] [原因]`);
@@ -856,6 +901,7 @@ async function cmdAddList(event, args, uid, userName, type) {
   db.prepare(`INSERT INTO ${type} (account, reason, reported_by) VALUES (?,?,?)`).run(acc, reason, userName);
   return reply(event, `✅ 已加入${type==='blacklist'?'黑':'白'}名單\n帳號：${acc}\n原因：${reason}`);
 }
+
 async function cmdListAll(event, uid, type) {
   if (!isAdmin(uid)) return reply(event, '❌ 此功能限管理員。');
   const r = db.prepare(`SELECT * FROM ${type} ORDER BY created_at DESC LIMIT 30`).all();
@@ -865,15 +911,15 @@ async function cmdListAll(event, uid, type) {
   return reply(event, m);
 }
 
-// ====== 匯款 ======
 async function cmdPayment(event, args, uid, userName) {
   if (args.length===0) return reply(event, '格式：匯款確認 [後五碼] [備註(選填)]');
   const lf = args[0];
   if (!/^\d{5}$/.test(lf)) return reply(event, '❌ 後五碼須為5位數字。');
   const note = args.slice(1).join(' ');
   db.prepare('INSERT INTO payments (member_id, member_name, last_five, note) VALUES (?,?,?,?)').run(uid, userName, lf, note);
-  return reply(event, `✅ 匯款已記錄\n${userName}｜${lf}${note?'\n'+note:''}\n管理員將盡快核對。`);
+  return reply(event, `✅ 匯款已記錄\n${userName}｜${lf}${note?'\n'+note:''}`);
 }
+
 async function cmdPayList(event, uid) {
   if (!isAdmin(uid)) return reply(event, '❌ 此功能限管理員。');
   const r = db.prepare('SELECT * FROM payments ORDER BY created_at DESC LIMIT 30').all();
@@ -883,7 +929,6 @@ async function cmdPayList(event, uid) {
   return reply(event, m);
 }
 
-// ====== 異議 ======
 async function cmdDispute(event, args, uid, userName) {
   if (args.length<2) return reply(event, '格式：申請異議 [場次ID] [說明]\n（請於收票後24小時內提出）');
   const sid = parseInt(args[0]);
@@ -892,7 +937,6 @@ async function cmdDispute(event, args, uid, userName) {
   return reply(event, `⚖️ 異議已記錄\n${userName}｜${s?s.name:'場次'+sid}\n${desc}\n\n管理員將於24小時內回覆。`);
 }
 
-// ====== 管理員管理 ======
 async function cmdAddAdmin(event, args, uid) {
   if (!isAdmin(uid)) return reply(event, '❌ 此功能限管理員。');
   if (args.length<1) return reply(event, '格式：新增管理員 [User ID] [名稱]');
@@ -900,6 +944,7 @@ async function cmdAddAdmin(event, args, uid) {
   db.prepare('INSERT OR IGNORE INTO admins (user_id, name) VALUES (?,?)').run(nid, n);
   return reply(event, `✅ 已將 ${n} 設為管理員`);
 }
+
 async function cmdListAdmins(event, uid) {
   if (!isAdmin(uid)) return reply(event, '❌ 此功能限管理員。');
   const l = db.prepare('SELECT * FROM admins').all();
@@ -908,22 +953,42 @@ async function cmdListAdmins(event, uid) {
   return reply(event, m);
 }
 
-// ====== 群組公告 ======
 async function cmdAnnounce(event, content, uid) {
   if (!isAdmin(uid)) return reply(event, '❌ 此功能限管理員。');
   if (!content.trim()) return reply(event, '格式：群組公告 [訊息]');
   await pushG(`📢 【公告】\n\n${content}`);
   return reply(event, '✅ 已發送公告。');
 }
+
 async function cmdFeatureUpdate(event, content, uid) {
   if (!isAdmin(uid)) return reply(event, '❌ 此功能限管理員。');
   if (!content.trim()) return reply(event, '格式：功能更新 [說明]');
   const date = new Date().toLocaleDateString('zh-TW',{timeZone:'Asia/Taipei'});
-  await pushG(`🔔 【功能更新】${date}\n\n${content}\n\n📌 查詢全部指令：說明`);
+  await pushG(`🔔 【功能更新】${date}\n\n${content}\n\n📌 查詢指令：說明`);
   return reply(event, '✅ 已發送更新通知。');
 }
 
-// ====== 文字內容 ======
+async function cmdManualBackup(event, uid) {
+  if (!isAdmin(uid)) return reply(event, '❌ 此功能限管理員。');
+  if (!octokit || !GH_OWNER) return reply(event, '❌ 備份未啟用（未設 GITHUB_TOKEN）');
+  await reply(event, '⏳ 備份中...');
+  const ok = await performBackup();
+  await pushU(uid, ok ? `✅ 備份完成\n時間：${lastBackupTime}\n查看：github.com/${GH_OWNER}/${GH_REPO}/tree/${BK_BRANCH}/data` : '❌ 備份失敗，請看 Render Logs');
+}
+
+async function cmdBackupStatus(event, uid) {
+  if (!isAdmin(uid)) return reply(event, '❌ 此功能限管理員。');
+  let m = '🗄️ 【備份狀態】\n';
+  if (!octokit) m += '❌ 未設定 GITHUB_TOKEN（未啟用）';
+  else if (!GH_OWNER) m += '❌ 未設定 GITHUB_OWNER';
+  else {
+    m += `✅ 已啟用\n👤 GitHub: ${GH_OWNER}/${GH_REPO}\n🌿 分支: ${BK_BRANCH}`;
+    m += lastBackupTime ? `\n⏰ 上次備份：${lastBackupTime}` : '\n⏰ 尚未備份（將於變更後 15 秒內執行）';
+    m += `\n\n查看：\ngithub.com/${GH_OWNER}/${GH_REPO}/tree/${BK_BRANCH}/data`;
+  }
+  return reply(event, m);
+}
+
 function txtHelp(admin) {
   let m = `🤖 【票務 Bot 指令】
 
@@ -955,14 +1020,15 @@ function txtHelp(admin) {
 • 申請異議 [場次] [說明]`;
   if (admin) m += `
 
-👑 管理員（建議私訊Bot）
-• 上場次 [URL] [演出日期] [搶票日] [地點]
+👑 管理員（建議私訊）
+🎵 場次
+• 上場次 [URL] [演出日] [搶票日] [地點]
 • 新增場次 [名稱] [演出] [搶] [地點] [票價]
 • 改場次名稱 [場次] [新名稱]
 • 設定上限 [場次] [票價] [張數]
 • 刪除場次 [場次]
 
-🏷️ 實名管理
+🏷️ 實名
 • 設定實名 [場次] [每帳號張數]
 • 取消實名 [場次]
 • 設定實名欄位 [場次] [欄位列表]
@@ -979,9 +1045,11 @@ function txtHelp(admin) {
 • 群組公告 [訊息]
 • 功能更新 [說明]
 
+🗄️ 備份
+• 立即備份 / 備份狀態
+
 ⚙️ 其他
-• 加黑/白名單 [帳號] [原因]
-• 黑/白名單列表
+• 加黑/白名單 / 黑/白名單列表
 • 匯款列表
 • 新增管理員 [User ID] [名稱]
 • 管理員列表`;
@@ -1015,12 +1083,12 @@ function txtRules() { return `📢 【規章】
 • 搶票日起不接受取消
 • 場次延期：不退款
 • 場次取消：退票面
-• 缺票：退缺少票面金額
+• 缺票：退缺少票面
 
 📝 實名制
 • 部分場次需提供實名資料
 • 一帳號限購對應張數
-• 資料不完整無法下單
+• 資料不齊無法下單
 
 ⚖️ 異議
 • 收票後 24 小時內提出`; }
@@ -1028,66 +1096,61 @@ function txtRules() { return `📢 【規章】
 function txtProcess() { return `🎟️ 【流程】
 
 ① 管理員上場次（自動偵測票價、設上限）
-   ↓
 ② 實名制場次：成員先提交實名
-   ↓
 ③ 成員下單（搶票日4天前截止）
-   ↓
-④ 搶票前 3 天：Bot 自動 @所有訂單成員
-   告知各人應付票面金額
-   ↓
+④ 搶票前 3 天：Bot @ 所有訂單成員
 ⑤ 搶票前 1 天：再次 @ 確認
-   ↓
 ⑥ 搶票日搶票
-   ↓
-⑦ 管理員私訊 Bot 輸入配票結果
-   ↓
-⑧ 配票完成 → 群組通知可查詢
-   ↓
-⑨ 成員私訊「我的配票 [場次]」查結果
-   ↓
+⑦ 管理員私訊 Bot 配票
+⑧ 配票完成 → 群組通知可查
+⑨ 成員私訊「我的配票 [場次]」
 ⑩ 結清行政費`; }
 
-// ====== 定時提醒（含 @mention）======
 function setupCron() {
   cron.schedule('0 9 * * *', async () => {
     const t = today();
     const shows = db.prepare('SELECT * FROM shows').all();
     for (const s of shows) {
       const days = dDiff(t, s.ticket_sale_date);
-      // 搶票前 3 天 - @mention 列出每人票面總額
       if (days === 3) {
         const mems = db.prepare(`SELECT member_id, member_name, SUM(quantity) qty, SUM(ticket_price*quantity) face FROM orders WHERE show_id=? AND status!="cancelled" GROUP BY member_id`).all(s.id);
         if (mems.length === 0) continue;
         const list = mems.map(m => ({ userId:m.member_id, name:m.member_name, note:`應付票面 ${ntStr(m.face)}（${m.qty}張）` }));
-        const intro = `⏰ 【搶票倒數 3 天】${s.name}\n搶票日：${fmtD(s.ticket_sale_date)}\n\n📌 收單將於3天後截止\n\n各成員應付票面金額：`;
+        const intro = `⏰ 【搶票倒數 3 天】${s.name}\n搶票日：${fmtD(s.ticket_sale_date)}\n\n📌 收單將於3天後截止\n\n各成員應付票面：`;
         await pushGroupMention(intro + '\n', list);
-        await pushG(`💡 想查詳細為什麼是這個價錢？\n私訊 Bot 輸入：我的明細 ${s.id}`);
+        await pushG(`💡 想查為什麼是這個價錢？\n私訊 Bot：我的明細 ${s.id}`);
       }
-      // 搶票前 1 天 - 再次 @mention 確認
       if (days === 1) {
         const mems = db.prepare(`SELECT member_id, member_name, SUM(quantity) qty, SUM(ticket_price*quantity) face FROM orders WHERE show_id=? AND status!="cancelled" GROUP BY member_id`).all(s.id);
         if (mems.length === 0) continue;
         const list = mems.map(m => ({ userId:m.member_id, name:m.member_name, note:`應付 ${ntStr(m.face)}` }));
         const intro = `🎫 【明日搶票 - 最後確認】${s.name}\n\n請以下成員確認並完成票面匯款：`;
         await pushGroupMention(intro + '\n', list);
-        await pushG(`💳 匯款後請輸入：匯款確認 [後五碼]\n📋 詳細明細：我的明細 ${s.id}（私訊Bot）\n❗搶票日起不接受取消`);
+        await pushG(`💳 匯款後：匯款確認 [後五碼]\n📋 明細：我的明細 ${s.id}（私訊）\n❗搶票日起不接受取消`);
       }
     }
   }, { timezone: 'Asia/Taipei' });
-  console.log('✅ 定時提醒已啟動（09:00 台北時間）');
+  // 每小時自動備份一次（保險措施）
+  if (octokit && GH_OWNER) {
+    cron.schedule('0 * * * *', () => performBackup().catch(console.error), { timezone: 'Asia/Taipei' });
+    console.log('✅ 自動備份排程已啟動（每小時一次）');
+  }
+  console.log('✅ 定時提醒已啟動');
 }
 
-// ====== Server ======
 app.post('/webhook', line.middleware(config), (req, res) => {
   Promise.all(req.body.events.map(handleEvent))
-    .then(r => res.json(r))
+    .then(r => { res.json(r); scheduleBackup(); })
     .catch(e => { console.error(e); res.status(500).end(); });
 });
 app.get('/', (req, res) => res.send('🤖 LINE Ticket Bot is running!'));
-app.get('/health', (req, res) => res.json({ status:'OK', time:new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ status:'OK', time:new Date().toISOString(), lastBackup:lastBackupTime }));
 
-initDB();
-setupCron();
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🤖 Bot 啟動，Port ${PORT}`));
+async function startup() {
+  initDB();
+  await restoreFromBackup();
+  setupCron();
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => console.log(`🤖 Bot 啟動，Port ${PORT}`));
+}
+startup();
