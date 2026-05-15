@@ -1,7 +1,7 @@
 {
   "name": "line-ticket-bot",
-  "version": "1.0.0",
-  "description": "LINE 票務群組機器人",
+  "version": "2.0.0",
+  "description": "LINE 票務群組機器人 (含 GitHub 永久備份)",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@line/bot-sdk": "^9.2.2",
+    "@octokit/rest": "^21.0.2",
     "better-sqlite3": "^11.10.0",
     "dotenv": "^16.4.5",
     "express": "^4.21.0",
