@@ -1,0 +1,18 @@
+{
+  "updated_at": "2026-05-15T13:46:14.052Z",
+  "version": "2.0",
+  "shows": [],
+  "orders": [],
+  "realname": [],
+  "allocations": [],
+  "payments": [],
+  "blacklist": [],
+  "whitelist": [],
+  "admins": [
+    {
+      "user_id": "U4d7251b7a1f9ba39af46d8e91ac61608",
+      "name": "主管理員",
+      "created_at": "2026-05-15 13:37:46"
+    }
+  ]
+}
