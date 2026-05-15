@@ -1,5 +1,5 @@
 {
-  "updated_at": "2026-05-15T14:08:27.897Z",
+  "updated_at": "2026-05-15T14:09:32.583Z",
   "version": "2.0",
   "shows": [
     {
@@ -12,7 +12,7 @@
       "price_tiers": "[6880,6680,6280,5480,4480]",
       "caps": "{\"4480\":50,\"5480\":50,\"6280\":50,\"6680\":36,\"6880\":30}",
       "is_real_name": 1,
-      "required_fields": "[\"name\",\"id_no\",\"phone\",\"site_acc\",\"site_pwd\"]",
+      "required_fields": "[\"name\",\"site_acc\",\"site_pwd\"]",
       "tickets_per_account": 1,
       "is_allocated": 0,
       "created_at": "2026-05-15 14:07:58"
