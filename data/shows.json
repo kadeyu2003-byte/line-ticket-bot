@@ -1,0 +1,17 @@
+[
+  {
+    "id": 1,
+    "name": "DxS",
+    "show_date": "2026-07-24",
+    "ticket_sale_date": "2026-05-30",
+    "venue": "高雄巨蛋",
+    "source_url": null,
+    "price_tiers": "[6880,6680,6280,5480,4480]",
+    "caps": "{\"4480\":50,\"5480\":50,\"6280\":50,\"6680\":36,\"6880\":30}",
+    "is_real_name": 1,
+    "required_fields": "[\"name\",\"id_no\",\"phone\",\"site_acc\",\"site_pwd\"]",
+    "tickets_per_account": 1,
+    "is_allocated": 0,
+    "created_at": "2026-05-15 14:07:58"
+  }
+]
