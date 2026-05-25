@@ -19,6 +19,7 @@ const store = require('../store');
  */
 
 const LIST_URL = process.env.TIX_LIST_URL || 'https://tixcraft.com/activity';
+const HOME_URL = 'https://tixcraft.com/';
 
 // 台灣地名關鍵字（用來判定台灣場次 vs 國外場次）
 const TW_HINTS = [
@@ -34,57 +35,53 @@ const BROWSER_HEADERS = {
   Accept: 'text/html,application/xhtml+xml',
 };
 
-/**
- * 抓取列表頁 HTML，依序嘗試：
- *  1) 若有設定 SCRAPER_API_KEY → 走 ScraperAPI 代抓（最穩，能過 Cloudflare）
- *  2) got-scraping（輕量、免費、模擬瀏覽器指紋，多數擋標頭型 403 可過）
- *  3) 一般 axios（最後手段）
- */
-async function fetchListHtml() {
-  // 方法 1：ScraperAPI（選用）
+/** 抓取單一 URL 的 HTML（ScraperAPI → got-scraping → axios） */
+async function fetchSinglePage(url) {
   const key = process.env.SCRAPER_API_KEY;
   if (key) {
     const premium = process.env.SCRAPER_PREMIUM === '1' ? '&premium=true' : '';
-    const api = `https://api.scraperapi.com/?api_key=${key}&country_code=tw${premium}&url=${encodeURIComponent(LIST_URL)}`;
+    const api = `https://api.scraperapi.com/?api_key=${key}&country_code=tw${premium}&url=${encodeURIComponent(url)}`;
     const res = await axios.get(api, { timeout: 60000, validateStatus: (s) => s < 600 });
-    if (res.status >= 400) throw new Error(`ScraperAPI 回傳 ${res.status}（可能需要設 SCRAPER_PREMIUM=1）`);
+    if (res.status >= 400) throw new Error(`ScraperAPI ${res.status}`);
     return res.data;
   }
-
-  // 方法 2：got-scraping
   try {
     const { gotScraping } = await import('got-scraping');
     const res = await gotScraping({
-      url: LIST_URL,
+      url,
       timeout: { request: 25000 },
       retry: { limit: 1 },
       headerGeneratorOptions: {
-        browsers: ['chrome'],
-        devices: ['desktop'],
-        locales: ['zh-TW'],
-        operatingSystems: ['windows'],
+        browsers: ['chrome'], devices: ['desktop'],
+        locales: ['zh-TW'], operatingSystems: ['windows'],
       },
     });
-    if (res.statusCode === 403) throw new Error('got-scraping 仍被回 403');
-    if (res.statusCode >= 400) throw new Error('got-scraping 回傳 ' + res.statusCode);
+    if (res.statusCode >= 400) throw new Error('got ' + res.statusCode);
     return res.body;
   } catch (e) {
-    // 方法 3：退回一般 axios
-    try {
-      const res = await axios.get(LIST_URL, {
-        headers: BROWSER_HEADERS,
-        timeout: 15000,
-        validateStatus: (s) => s < 600,
-      });
-      if (res.status === 403) {
-        throw new Error('403：拓元擋下存取（可能是 Cloudflare）。請到 Render 設定 SCRAPER_API_KEY，見 README。');
-      }
-      if (res.status >= 400) throw new Error('axios 回傳 ' + res.status);
-      return res.data;
-    } catch (e2) {
-      throw new Error(e.message + ' / ' + e2.message);
-    }
+    const res = await axios.get(url, { headers: BROWSER_HEADERS, timeout: 15000, validateStatus: s => s < 600 });
+    if (res.status >= 400) throw new Error('axios ' + res.status);
+    return res.data;
   }
+}
+
+/**
+ * 抓取首頁 + /activity 兩頁，合併 HTML 後回傳。
+ * 首頁常有 SSR 的活動連結；/activity 可能有 JS 內嵌 JSON。
+ */
+async function fetchListHtml() {
+  const pages = await Promise.allSettled([
+    fetchSinglePage(HOME_URL),
+    fetchSinglePage(LIST_URL),
+  ]);
+  const htmlParts = pages
+    .filter((p) => p.status === 'fulfilled')
+    .map((p) => p.value);
+  if (htmlParts.length === 0) {
+    const errs = pages.map((p) => p.reason?.message).join(' / ');
+    throw new Error('首頁 + /activity 都抓取失敗：' + errs);
+  }
+  return htmlParts.join('\n<!-- PAGE_BREAK -->\n');
 }
 
 /** 手動診斷：抓一次並回報結果（給 OWNER 用「測試拓元」呼叫） */
@@ -92,8 +89,23 @@ async function diagnose() {
   try {
     const html = await fetchListHtml();
     const events = parseEvents(html);
+    // HTML 摘要（幫助除錯）
+    const htmlLen = html.length;
+    const hasScript = html.includes('<script');
+    const detailCount = (html.match(/\/activity\/detail\//g) || []).length;
+    const actGameCount = (html.match(/\/activity\/game\//g) || []).length;
+
     if (events.length === 0) {
-      return '⚠️ 抓取成功，但解析到 0 筆。\n可能是拓元 HTML 改版，需調整 parseEvents() 的選擇器。';
+      return [
+        '⚠️ 抓取成功但解析到 0 筆',
+        `📊 HTML 長度：${htmlLen.toLocaleString()} 字`,
+        `🔍 含 <script>：${hasScript ? '有' : '無'}`,
+        `🔗 /activity/detail/ 出現：${detailCount} 次`,
+        `🔗 /activity/game/ 出現：${actGameCount} 次`,
+        `📝 前 200 字：\n${html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').substring(0, 200)}…`,
+        '',
+        '💡 如果出現 0 次，代表拓元頁面內容要靠 JS 才載入，需改用 ScraperAPI（設定 SCRAPER_API_KEY）',
+      ].join('\n');
     }
     const sample = events.slice(0, 5).map((e) => '• ' + e.title).join('\n');
     return [
@@ -109,26 +121,70 @@ async function diagnose() {
   }
 }
 
-/** 從 HTML 解析出場次清單 [{title, url, text}] */
+/**
+ * 從 HTML 解析出場次清單 [{title, url}]
+ * 多重策略：
+ *  1) 標準 <a> 標籤（SSR 頁面）
+ *  2) 正則掃描整段 HTML（抓 script 裡的 JSON 資料）
+ *  3) JSON-LD 結構化資料
+ */
 function parseEvents(html) {
   const $ = cheerio.load(html);
+  const seen = new Set();
   const events = [];
-  const seenHere = new Set();
 
-  // 拓元活動連結通常含 /activity/detail/
+  function add(url, title) {
+    const norm = url.replace(/^https?:\/\/[^/]+/, '');
+    if (seen.has(norm)) return;
+    seen.add(norm);
+    const full = url.startsWith('http') ? url : `https://tixcraft.com${url}`;
+    const clean = (title || '').replace(/\s+/g, ' ').trim();
+    if (clean) events.push({ title: clean, url: full });
+  }
+
+  // 策略 1：標準 <a> 標籤
   $('a[href*="/activity/detail/"]').each((_, el) => {
+    add($(el).attr('href') || '', $(el).attr('title') || $(el).text());
+  });
+  // 也抓 /activity/game/ 連結（拓元另一種格式）
+  $('a[href*="/activity/game/"]').each((_, el) => {
+    add($(el).attr('href') || '', $(el).attr('title') || $(el).text());
+  });
+  // 也抓首頁常見的 activity 連結（/activity/XXX 不含子路徑）
+  $('a[href]').each((_, el) => {
     const href = $(el).attr('href') || '';
-    const url = href.startsWith('http') ? href : `https://tixcraft.com${href}`;
-    if (seenHere.has(url)) return;
-    seenHere.add(url);
+    if (/^\/activity\/[^/]+$/.test(href) && !href.includes('.')) {
+      add(href, $(el).attr('title') || $(el).text());
+    }
+  });
 
-    // 標題：優先用連結文字 / title 屬性 / 內部標題元素
-    const title =
-      ($(el).attr('title') || $(el).text() || $(el).find('h3,h2,.content,.name').first().text() || '')
-        .replace(/\s+/g, ' ')
-        .trim();
+  // 策略 2：正則掃描整段 HTML（抓藏在 script / JSON 裡的 URL + 標題）
+  // 找所有 /activity/detail/XXX 或 /activity/game/XXX
+  const urlRe = /(?:https?:\/\/tixcraft\.com)?\/activity\/(?:detail|game)\/([a-zA-Z0-9_%-]+)/g;
+  let m;
+  while ((m = urlRe.exec(html)) !== null) {
+    const url = m[0].startsWith('http') ? m[0] : `https://tixcraft.com${m[0]}`;
+    // 試從附近內容抓標題（在 URL 前後 200 字內找有意義文字）
+    const pos = m.index;
+    const ctx = html.substring(Math.max(0, pos - 200), Math.min(html.length, pos + 300));
+    // 找引號包起來的標題
+    const titleMatch = ctx.match(/"(?:title|name|eventName)"\s*[:=]\s*"([^"]{3,80})"/i)
+      || ctx.match(/>([^<]{5,80})</);
+    const title = titleMatch ? titleMatch[1].replace(/\s+/g, ' ').trim() : m[1].replace(/_/g, ' ');
+    add(url, title);
+  }
 
-    if (title) events.push({ title, url });
+  // 策略 3：JSON-LD
+  $('script[type="application/ld+json"]').each((_, el) => {
+    try {
+      const data = JSON.parse($(el).html());
+      const items = Array.isArray(data) ? data : [data];
+      for (const item of items) {
+        if (item.url && /tixcraft/.test(item.url)) {
+          add(item.url, item.name || item.headline || '');
+        }
+      }
+    } catch (_) {}
   });
 
   return events;
