@@ -1,20 +1,22 @@
 {
   "name": "line-ticket-bot",
-  "version": "2.0.0",
-  "description": "LINE 票務群組機器人 (含 GitHub 永久備份)",
-  "main": "index.js",
+  "version": "2.1.0",
+  "description": "LINE 群組票務管理機器人：場次登記、訂單、繳費提醒、拓元新場次偵測",
+  "main": "app.js",
   "scripts": {
-    "start": "node index.js"
-  },
-  "engines": {
-    "node": "22.x"
+    "start": "node app.js",
+    "dev": "node --watch app.js"
   },
   "dependencies": {
     "@line/bot-sdk": "^9.2.2",
-    "@octokit/rest": "^21.0.2",
-    "better-sqlite3": "^11.10.0",
+    "axios": "^1.7.7",
+    "cheerio": "^1.0.0",
     "dotenv": "^16.4.5",
     "express": "^4.21.0",
+    "got-scraping": "^4.0.6",
     "node-cron": "^3.0.3"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
