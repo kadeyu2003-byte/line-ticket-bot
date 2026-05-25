@@ -123,70 +123,47 @@ async function diagnose() {
 
 /**
  * 從 HTML 解析出場次清單 [{title, url}]
- * 多重策略：
- *  1) 標準 <a> 標籤（SSR 頁面）
- *  2) 正則掃描整段 HTML（抓 script 裡的 JSON 資料）
- *  3) JSON-LD 結構化資料
+ * 最簡單穩定的做法：用正則從整段 HTML 掃出所有 /activity/detail/XXX slug，
+ * 再嘗試從附近 JSON 抓標題。
  */
 function parseEvents(html) {
-  const $ = cheerio.load(html);
-  const seen = new Set();
-  const events = [];
+  const slugs = new Map(); // slug → title
 
-  function add(url, title) {
-    const norm = url.replace(/^https?:\/\/[^/]+/, '');
-    if (seen.has(norm)) return;
-    seen.add(norm);
-    const full = url.startsWith('http') ? url : `https://tixcraft.com${url}`;
-    const clean = (title || '').replace(/\s+/g, ' ').trim();
-    if (clean) events.push({ title: clean, url: full });
-  }
-
-  // 策略 1：標準 <a> 標籤
-  $('a[href*="/activity/detail/"]').each((_, el) => {
-    add($(el).attr('href') || '', $(el).attr('title') || $(el).text());
-  });
-  // 也抓 /activity/game/ 連結（拓元另一種格式）
-  $('a[href*="/activity/game/"]').each((_, el) => {
-    add($(el).attr('href') || '', $(el).attr('title') || $(el).text());
-  });
-  // 也抓首頁常見的 activity 連結（/activity/XXX 不含子路徑）
-  $('a[href]').each((_, el) => {
-    const href = $(el).attr('href') || '';
-    if (/^\/activity\/[^/]+$/.test(href) && !href.includes('.')) {
-      add(href, $(el).attr('title') || $(el).text());
-    }
-  });
-
-  // 策略 2：正則掃描整段 HTML（抓藏在 script / JSON 裡的 URL + 標題）
-  // 找所有 /activity/detail/XXX 或 /activity/game/XXX
-  const urlRe = /(?:https?:\/\/tixcraft\.com)?\/activity\/(?:detail|game)\/([a-zA-Z0-9_%-]+)/g;
+  // 第一輪：掃出所有唯一的 slug
+  const re = /\/activity\/detail\/([a-zA-Z0-9_.-]+)/g;
   let m;
-  while ((m = urlRe.exec(html)) !== null) {
-    const url = m[0].startsWith('http') ? m[0] : `https://tixcraft.com${m[0]}`;
-    // 試從附近內容抓標題（在 URL 前後 200 字內找有意義文字）
-    const pos = m.index;
-    const ctx = html.substring(Math.max(0, pos - 200), Math.min(html.length, pos + 300));
-    // 找引號包起來的標題
-    const titleMatch = ctx.match(/"(?:title|name|eventName)"\s*[:=]\s*"([^"]{3,80})"/i)
-      || ctx.match(/>([^<]{5,80})</);
-    const title = titleMatch ? titleMatch[1].replace(/\s+/g, ' ').trim() : m[1].replace(/_/g, ' ');
-    add(url, title);
+  while ((m = re.exec(html)) !== null) {
+    const slug = m[1];
+    if (!slugs.has(slug)) slugs.set(slug, null);
   }
 
-  // 策略 3：JSON-LD
-  $('script[type="application/ld+json"]').each((_, el) => {
-    try {
-      const data = JSON.parse($(el).html());
-      const items = Array.isArray(data) ? data : [data];
-      for (const item of items) {
-        if (item.url && /tixcraft/.test(item.url)) {
-          add(item.url, item.name || item.headline || '');
-        }
-      }
-    } catch (_) {}
-  });
+  // 第二輪：嘗試從 <script> 裡找 JSON 格式的標題
+  // 常見模式："title":"EVENT NAME" 附近伴隨 /activity/detail/SLUG
+  for (const slug of slugs.keys()) {
+    // 在 HTML 中找 slug 附近 500 字的上下文
+    const idx = html.indexOf('/activity/detail/' + slug);
+    if (idx === -1) continue;
+    const ctx = html.substring(Math.max(0, idx - 400), Math.min(html.length, idx + 400));
 
+    // 嘗試幾種常見 JSON 格式
+    const t =
+      ctx.match(/"(?:title|name|eventName|act_name)"\s*:\s*"([^"]{3,120})"/i) ||
+      ctx.match(/"([^"]{5,120})"\s*,\s*"(?:url|link|href)"/i) ||
+      ctx.match(/alt="([^"]{5,120})"/i);
+
+    if (t) {
+      slugs.set(slug, t[1].replace(/\\[/\\]/g, '').replace(/\s+/g, ' ').trim());
+    }
+  }
+
+  // 組成結果
+  const events = [];
+  for (const [slug, title] of slugs) {
+    events.push({
+      title: title || slug.replace(/^\d+_/, '').replace(/_/g, ' '),
+      url: `https://tixcraft.com/activity/detail/${slug}`,
+    });
+  }
   return events;
 }
 
