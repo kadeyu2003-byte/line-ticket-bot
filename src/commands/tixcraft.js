@@ -66,22 +66,49 @@ async function fetchSinglePage(url) {
 }
 
 /**
- * 抓取首頁 + /activity 兩頁，合併 HTML 後回傳。
- * 首頁常有 SSR 的活動連結；/activity 可能有 JS 內嵌 JSON。
+ * 抓取某站台的首頁 + /activity，回傳解析好的 events [{title, url, source}]
+ * @param {string} baseDomain e.g. 'https://tixcraft.com' or 'https://ticketmaster.sg'
  */
+async function fetchAndParse(baseDomain) {
+  const base = baseDomain.replace(/\/+$/, '');
+  const urls = [base + '/', base + '/activity'];
+  const pages = await Promise.allSettled(urls.map(fetchSinglePage));
+  const htmlParts = pages.filter(p => p.status === 'fulfilled').map(p => p.value);
+  if (htmlParts.length === 0) throw new Error(`${base} 抓取失敗`);
+  const html = htmlParts.join('\n');
+  return parseEvents(html, base);
+}
+
+/** 抓取所有站台（台灣 + 海外），回傳 { twEvents, overseasEvents } */
+async function fetchAllEvents() {
+  const twEvents = [];
+  const overseasEvents = [];
+  // 台灣
+  try {
+    const events = await fetchAndParse('https://tixcraft.com');
+    events.forEach(e => {
+      if (isTaiwan(e.title) || isTaiwan(e.url)) twEvents.push(e);
+      else overseasEvents.push(e);
+    });
+  } catch (e) { console.error('[拓元TW]', e.message); }
+  // 海外站台
+  const sites = store.data.tix.overseasSites || [];
+  for (const site of sites) {
+    try {
+      const events = await fetchAndParse(site);
+      overseasEvents.push(...events);
+    } catch (e) { console.error(`[拓元 ${site}]`, e.message); }
+  }
+  return { twEvents, overseasEvents };
+}
+
+/** 向後兼容：舊的 fetchListHtml for diagnose */
 async function fetchListHtml() {
   const pages = await Promise.allSettled([
-    fetchSinglePage(HOME_URL),
-    fetchSinglePage(LIST_URL),
+    fetchSinglePage('https://tixcraft.com/'),
+    fetchSinglePage('https://tixcraft.com/activity'),
   ]);
-  const htmlParts = pages
-    .filter((p) => p.status === 'fulfilled')
-    .map((p) => p.value);
-  if (htmlParts.length === 0) {
-    const errs = pages.map((p) => p.reason?.message).join(' / ');
-    throw new Error('首頁 + /activity 都抓取失敗：' + errs);
-  }
-  return htmlParts.join('\n<!-- PAGE_BREAK -->\n');
+  return pages.filter(p => p.status === 'fulfilled').map(p => p.value).join('\n') || '';
 }
 
 /** 手動診斷：抓一次並回報結果（給 OWNER 用「測試拓元」呼叫） */
@@ -124,42 +151,30 @@ async function diagnose() {
  * 最簡單穩定的做法：用正則從整段 HTML 掃出所有 /activity/detail/XXX slug，
  * 再嘗試從附近 JSON 抓標題。
  */
-function parseEvents(html) {
-  const slugs = new Map(); // slug → title
-
-  // 第一輪：掃出所有唯一的 slug
+function parseEvents(html, baseDomain) {
+  const base = (baseDomain || 'https://tixcraft.com').replace(/\/+$/, '');
+  const slugs = new Map();
   const re = /\/activity\/detail\/([a-zA-Z0-9_.-]+)/g;
   let m;
   while ((m = re.exec(html)) !== null) {
-    const slug = m[1];
-    if (!slugs.has(slug)) slugs.set(slug, null);
+    if (!slugs.has(m[1])) slugs.set(m[1], null);
   }
-
-  // 第二輪：嘗試從 <script> 裡找 JSON 格式的標題
-  // 常見模式："title":"EVENT NAME" 附近伴隨 /activity/detail/SLUG
   for (const slug of slugs.keys()) {
-    // 在 HTML 中找 slug 附近 500 字的上下文
     const idx = html.indexOf('/activity/detail/' + slug);
     if (idx === -1) continue;
     const ctx = html.substring(Math.max(0, idx - 400), Math.min(html.length, idx + 400));
-
-    // 嘗試幾種常見 JSON 格式
     const t =
       ctx.match(/"(?:title|name|eventName|act_name)"\s*:\s*"([^"]{3,120})"/i) ||
       ctx.match(/"([^"]{5,120})"\s*,\s*"(?:url|link|href)"/i) ||
       ctx.match(/alt="([^"]{5,120})"/i);
-
-    if (t) {
-      slugs.set(slug, t[1].replace(/\\[/\\]/g, '').replace(/\s+/g, ' ').trim());
-    }
+    if (t) slugs.set(slug, t[1].replace(/\\[/\\]/g, '').replace(/\s+/g, ' ').trim());
   }
-
-  // 組成結果
   const events = [];
   for (const [slug, title] of slugs) {
     events.push({
-      title: title || slug.replace(/^\d+_/, '').replace(/_/g, ' '),
-      url: `https://tixcraft.com/activity/detail/${slug}`,
+      title: title || slug.replace(/^\d+[a-z]*_/, '').replace(/_/g, ' '),
+      url: `${base}/activity/detail/${slug}`,
+      source: base,
     });
   }
   return events;
@@ -170,12 +185,45 @@ function isTaiwan(title) {
   return TW_HINTS.some((k) => title.includes(k));
 }
 
-/** 是否符合使用者設定的國外關鍵字 */
-function matchKeyword(title) {
+/** 是否符合使用者設定的國外關鍵字（檢查標題和 URL） */
+function matchKeyword(text) {
   const kws = store.data.tix.keywords || [];
-  const lower = title.toLowerCase();
-  const hit = kws.find((k) => lower.includes(k.toLowerCase()));
-  return hit || null;
+  const lower = (text || '').toLowerCase();
+  return kws.find((k) => lower.includes(k.toLowerCase())) || null;
+}
+
+// ============== 海外站台管理 ==============
+
+function listOverseasSites() {
+  const sites = store.data.tix.overseasSites || [];
+  return [
+    '🌍 海外站台列表：',
+    sites.length ? sites.map(s => `• ${s}`).join('\n') : '（無）',
+    '', '➕ 新增：新增海外站 [網址]', '➖ 移除：移除海外站 [網址]',
+  ].join('\n');
+}
+
+function addOverseasSite(isOwner, args) {
+  if (!isOwner) return '⛔ 僅限主管理員。';
+  if (!args[0]) return '❌ 格式：新增海外站 https://ticketmaster.sg';
+  const url = args[0].replace(/\/+$/, '');
+  if (!url.startsWith('http')) return '❌ 請輸入完整網址（https://開頭）';
+  if (!store.data.tix.overseasSites) store.data.tix.overseasSites = [];
+  if (store.data.tix.overseasSites.includes(url)) return `⚠️ 「${url}」已在列表中。`;
+  store.data.tix.overseasSites.push(url);
+  store.save();
+  return `✅ 已新增海外站：${url}\n\n${listOverseasSites()}`;
+}
+
+function removeOverseasSite(isOwner, args) {
+  if (!isOwner) return '⛔ 僅限主管理員。';
+  if (!args[0]) return '❌ 格式：移除海外站 [網址]';
+  const url = args[0].replace(/\/+$/, '');
+  const before = (store.data.tix.overseasSites || []).length;
+  store.data.tix.overseasSites = (store.data.tix.overseasSites || []).filter(s => s !== url);
+  if (store.data.tix.overseasSites.length === before) return `❌ 找不到「${url}」。`;
+  store.save();
+  return `✅ 已移除：${url}\n\n${listOverseasSites()}`;
 }
 
 /**
@@ -184,63 +232,43 @@ function matchKeyword(title) {
  */
 async function checkOnce(silentFirstRun = false) {
   if (!store.data.tix.enabled) return [];
-
-  let html;
+  let twEvents, overseasEvents;
   try {
-    html = await fetchListHtml();
+    ({ twEvents, overseasEvents } = await fetchAllEvents());
   } catch (e) {
-    console.error('[拓元偵測] 抓取失敗：', e.message);
+    console.error('[拓元偵測]', e.message);
     return [];
   }
-
-  const events = parseEvents(html);
-  if (events.length === 0) {
-    console.warn('[拓元偵測] 解析到 0 筆，可能是 HTML 結構改版，請檢查選擇器。');
-    return [];
-  }
+  const allEvents = [...twEvents, ...overseasEvents];
+  if (allEvents.length === 0) { console.warn('[拓元偵測] 0 筆'); return []; }
 
   const seen = new Set(store.data.tix.seen);
-  const fresh = events.filter((e) => !seen.has(e.url));
+  const freshTw = twEvents.filter(e => !seen.has(e.url));
+  const freshOverseas = overseasEvents.filter(e => !seen.has(e.url));
 
-  // 更新已知清單
-  store.data.tix.seen = events.map((e) => e.url);
+  store.data.tix.seen = allEvents.map(e => e.url);
   store.save();
 
   if (silentFirstRun) {
-    console.log(`[拓元偵測] 首次建立基準：${events.length} 筆，不發通知。`);
+    console.log(`[拓元] 基準：TW ${twEvents.length} + 海外 ${overseasEvents.length}`);
     return [];
   }
-  if (fresh.length === 0) return [];
-
   const messages = [];
-  const twNew = [];
-  const overseasNew = [];
-
-  for (const e of fresh) {
-    if (isTaiwan(e.title)) {
-      twNew.push(e);
-    } else {
-      const kw = matchKeyword(e.title);
-      if (kw) overseasNew.push({ ...e, kw });
-    }
+  if (freshTw.length > 0) {
+    let m = `🔔 拓元偵測到 ${freshTw.length} 個新的【台灣】場次！\n` + '─'.repeat(22) + '\n';
+    freshTw.forEach(e => { m += `🎫 ${e.title}\n${e.url}\n`; });
+    messages.push(m.trim());
   }
-
-  if (twNew.length > 0) {
-    let m = `🔔 拓元偵測到 ${twNew.length} 個新的【台灣】場次！\n` + '─'.repeat(22) + '\n';
-    twNew.forEach((e) => {
-      m += `🎫 ${e.title}\n${e.url}\n`;
+  // 海外：只通知關鍵字命中
+  const kwHits = freshOverseas.filter(e => matchKeyword(e.title) || matchKeyword(e.url));
+  if (kwHits.length > 0) {
+    let m = `🌍 偵測到符合關鍵字的【海外】場次！\n` + '─'.repeat(22) + '\n';
+    kwHits.forEach(e => {
+      const kw = matchKeyword(e.title) || matchKeyword(e.url);
+      m += `🔥【${kw}】${e.title}\n${e.url}\n`;
     });
     messages.push(m.trim());
   }
-
-  if (overseasNew.length > 0) {
-    let m = `🌍 拓元偵測到符合關鍵字的【國外】場次！\n` + '─'.repeat(22) + '\n';
-    overseasNew.forEach((e) => {
-      m += `🔥【${e.kw}】${e.title}\n${e.url}\n`;
-    });
-    messages.push(m.trim());
-  }
-
   return messages;
 }
 
@@ -320,4 +348,5 @@ async function searchEvents(isOwner, args) {
 module.exports = {
   checkOnce, diagnose, searchEvents, resetSeen,
   listKeywords, addKeyword, removeKeyword, toggleMonitor,
+  listOverseasSites, addOverseasSite, removeOverseasSite,
 };

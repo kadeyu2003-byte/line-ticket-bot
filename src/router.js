@@ -41,6 +41,9 @@ function route(ctx) {
     case '開啟偵測': return tix.toggleMonitor(isOwner, true);
     case '關閉偵測': return tix.toggleMonitor(isOwner, false);
     case '重設偵測': return tix.resetSeen(isOwner);
+    case '海外站': case '查海外站': return tix.listOverseasSites();
+    case '新增海外站': return tix.addOverseasSite(isOwner, args);
+    case '移除海外站': return tix.removeOverseasSite(isOwner, args);
     case '設定主群組':
       if (!isOwner) return '⛔ 僅限主管理員。';
       if (!groupId) return '❌ 請在群組內輸入。';

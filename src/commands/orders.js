@@ -24,7 +24,7 @@ function order(userId, userName, args) {
   if (d < 0) return `🚫 「${e.name} - ${e.session}」搶票日已過，無法登記。`;
   if (d <= 3) return `🚫 距搶票日僅剩 ${d} 天，已停止登記。如有急需請私訊管理員。`;
   if (!e.prices.includes(price)) return `❌ 票價 ${money(price)} 不在此場次。可選：${e.prices.join(' / ')}`;
-  if (!qty || qty <= 0 || qty > 20) return '❌ 張數需介於 1~20。';
+  if (isNaN(qty) || !qty || qty <= 0 || qty > 20) return `❌ 張數請填 1~20 的數字。\n你輸入的「${args[2]}」不是有效數字。`;
 
   if (!store.data.orders[id]) store.data.orders[id] = {};
   if (!store.data.orders[id][userId]) {
@@ -67,11 +67,14 @@ function cancel(userId, userName, args) {
   if (args.length < 3) return '❌ 格式：取消下單 [編號] [票價] [張數] [備註]';
   const id = Number(args[0]), price = Number(args[1]), qty = parseInt(args[2], 10);
   const note = args.slice(3).join(' ').trim();
+  if (!qty || isNaN(qty) || qty <= 0) return '❌ 張數請填正整數，例如：取消下單 4 9380 1';
   const e = store.data.events[id];
   if (!e) return `❌ 找不到場次 #${args[0]}。`;
   if (daysUntil(e.grabDate) <= 0) return '🚫 搶票日起不接受取消。';
   const rec = store.data.orders[id]?.[userId];
   if (!rec || !Array.isArray(rec.items)) return '❌ 找不到您的訂單。';
+  // 自動清理 NaN 損壞資料
+  rec.items = rec.items.filter(it => !isNaN(it.qty) && it.qty > 0);
   const idx = rec.items.findIndex(it => it.price === price && (it.note || '') === note);
   if (idx === -1) return `❌ 找不到 ${money(price)}${note ? '（' + note + '）' : ''} 的登記。`;
   if (rec.items[idx].qty < qty) return `❌ 只有 ${rec.items[idx].qty} 張，無法取消 ${qty} 張。`;
@@ -86,7 +89,11 @@ function myOrders(userId, userName) {
   const mine = [];
   for (const e of Object.values(store.data.events)) {
     const rec = store.data.orders[e.id]?.[userId];
-    if (rec && Array.isArray(rec.items) && rec.items.length > 0) mine.push({ e, rec });
+    if (rec && Array.isArray(rec.items) && rec.items.length > 0) {
+      // 自動清理 NaN 損壞資料
+      rec.items = rec.items.filter(it => !isNaN(it.qty) && it.qty > 0);
+      if (rec.items.length > 0) mine.push({ e, rec });
+    }
   }
   if (mine.length === 0) return `📭 ${userName}，目前沒有任何登記。`;
   let msg = `📋 ${userName} 的訂單\n` + DLINE + '\n';

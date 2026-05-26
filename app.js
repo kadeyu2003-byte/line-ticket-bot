@@ -30,7 +30,7 @@ function isAdmin(userId) {
   return isOwner(userId) || ADMIN_IDS.has(userId);
 }
 
-store.load();
+store.load(); // 先同步載入本機檔（如果有的話）
 
 // ---------- 推播 ----------
 async function pushToGroups(text) {
@@ -163,16 +163,19 @@ cron.schedule(
 );
 
 // ---------- 啟動 ----------
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, async () => {
-  console.log(`✅ Bot 啟動，Port ${PORT}`);
-  console.log(`⭐ OWNER：${OWNER_ID || '(未設定)'}`);
-  console.log(`👑 ADMIN：${[...ADMIN_IDS].join(', ') || '(無)'}`);
+async function main() {
+  // 連接 MongoDB（如果有設定），資料持久化
+  await store.init();
 
-  // 首次建立拓元基準（不發通知），之後才比對新場次
-  if (store.data.tix.seen.length === 0) {
-    await tix.checkOnce(true).catch((e) => console.error('[拓元首跑]', e.message));
-  }
-});
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, async () => {
+    console.log(`✅ Bot 啟動，Port ${PORT}`);
+    console.log(`⭐ OWNER：${OWNER_ID || '(未設定)'}`);
+    console.log(`👑 ADMIN：${[...ADMIN_IDS].join(', ') || '(無)'}`);
 
-module.exports = { app };
+    if (store.data.tix.seen.length === 0) {
+      await tix.checkOnce(true).catch((e) => console.error('[拓元首跑]', e.message));
+    }
+  });
+}
+main().catch(e => { console.error('啟動失敗：', e); process.exit(1); });
