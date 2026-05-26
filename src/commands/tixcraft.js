@@ -107,15 +107,13 @@ async function diagnose() {
         '💡 如果出現 0 次，代表拓元頁面內容要靠 JS 才載入，需改用 ScraperAPI（設定 SCRAPER_API_KEY）',
       ].join('\n');
     }
-    const sample = events.slice(0, 5).map((e) => '• ' + e.title).join('\n');
+    const sample = events.slice(0, 15).map((e) => '• ' + e.title).join('\n');
     return [
-      `✅ 拓元抓取成功！共解析到 ${events.length} 個場次。`,
-      '範例：',
+      `✅ 拓元抓取成功！共 ${events.length} 個場次。`,
       sample,
-      '',
-      `🔑 偵測關鍵字：${store.data.tix.keywords.join('、')}`,
-      '📌 之後系統會自動比對新場次並通知。',
-    ].join('\n');
+      events.length > 15 ? `…及其他 ${events.length - 15} 個` : '',
+      `\n🔑 關鍵字：${store.data.tix.keywords.join('、')}`,
+    ].filter(Boolean).join('\n');
   } catch (e) {
     return '❌ 拓元抓取失敗：\n' + e.message;
   }
@@ -292,11 +290,34 @@ function toggleMonitor(isOwner, on) {
   return on ? '🟢 已開啟拓元新場次偵測。' : '🔴 已關閉拓元新場次偵測。';
 }
 
+/** 重設偵測：清除已知清單，下次偵測會把所有場次當新的通知 */
+function resetSeen(isOwner) {
+  if (!isOwner) return '⛔ 僅限主管理員。';
+  const count = store.data.tix.seen.length;
+  store.data.tix.seen = [];
+  store.save();
+  return `✅ 已清除 ${count} 筆已知場次紀錄。\n下次偵測會重新通知所有場次（含 BTS 等先前已存在的）。`;
+}
+
+/** 搜尋拓元：從目前已知場次中搜尋關鍵字 */
+async function searchEvents(isOwner, args) {
+  if (!isOwner) return '⛔ 僅限主管理員。';
+  if (!args[0]) return '❌ 格式：搜尋拓元 [關鍵字]';
+  const kw = args.join(' ').toLowerCase();
+  try {
+    const html = await fetchListHtml();
+    const events = parseEvents(html);
+    const hits = events.filter(e => e.title.toLowerCase().includes(kw) || e.url.toLowerCase().includes(kw));
+    if (hits.length === 0) return `🔍 在 ${events.length} 個場次中找不到「${args.join(' ')}」。`;
+    let msg = `🔍 搜尋「${args.join(' ')}」找到 ${hits.length} 筆：\n`;
+    hits.forEach(e => { msg += `• ${e.title}\n  ${e.url}\n`; });
+    return msg.trim();
+  } catch (e) {
+    return '❌ 搜尋失敗：' + e.message;
+  }
+}
+
 module.exports = {
-  checkOnce,
-  diagnose,
-  listKeywords,
-  addKeyword,
-  removeKeyword,
-  toggleMonitor,
+  checkOnce, diagnose, searchEvents, resetSeen,
+  listKeywords, addKeyword, removeKeyword, toggleMonitor,
 };

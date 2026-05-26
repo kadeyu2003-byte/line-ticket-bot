@@ -118,6 +118,15 @@ async function handleEvent(event) {
     return;
   }
 
+  // 搜尋拓元場次（限主管理員，async）
+  if (/^搜尋拓元/.test(t)) {
+    const sArgs = t.replace(/^搜尋拓元\s*/, '').trim().split(/\s+/).filter(Boolean);
+    await client.replyMessage(event.replyToken, { type: 'text', text: '🔍 搜尋中…' });
+    const result = await tix.searchEvents(isOwner(userId), sArgs);
+    await pushToGroups(result);
+    return;
+  }
+
   const reply = route({
     text: event.message.text,
     userId,
