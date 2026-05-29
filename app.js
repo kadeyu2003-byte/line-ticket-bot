@@ -33,18 +33,14 @@ function isAdmin(userId) {
 store.load(); // 先同步載入本機檔（如果有的話）
 
 // ---------- 推播 ----------
-async function pushToGroups(text) {
+/** 推播到群組（支援 string 或 LINE message 物件） */
+async function pushToGroups(msgOrText) {
   const targets = store.pushTargets();
-  if (targets.length === 0) {
-    console.warn('[推播] 尚無群組可推送（請先把機器人拉進群組並發一則訊息）。');
-    return;
-  }
+  if (targets.length === 0) return;
+  const msg = typeof msgOrText === 'string' ? { type: 'text', text: msgOrText } : msgOrText;
   for (const to of targets) {
-    try {
-      await client.pushMessage(to, { type: 'text', text });
-    } catch (e) {
-      console.error('[推播失敗]', to, e.message);
-    }
+    try { await client.pushMessage(to, msg); }
+    catch (e) { console.error('[推播失敗]', to, e.message); }
   }
 }
 
@@ -143,11 +139,11 @@ async function handleEvent(event) {
 }
 
 // ---------- 排程 ----------
-// 每天 10:00（台灣）跑提醒
+// 催繳提醒：每小時跑一次（帶 @tag，漸進式催繳）
 cron.schedule(
-  '0 10 * * *',
+  '0 * * * *',
   () => {
-    reminders.runDaily(pushToGroups).catch((e) => console.error('[提醒]', e));
+    reminders.runHourly(pushToGroups).catch((e) => console.error('[提醒]', e));
   },
   { timezone: TZ }
 );
