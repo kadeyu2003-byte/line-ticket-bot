@@ -1,6 +1,6 @@
 'use strict';
 const store=require('./store');
-const {daysUntil,money,getItemFee,isLastDayOfMonth,nowTW,LINE,DLINE}=require('./helpers');
+const {daysUntil,money,getEffectiveFee,isLastDayOfMonth,nowTW,LINE,DLINE}=require('./helpers');
 const {ensureArray}=require('./commands/orders');
 
 function activeMembers(eid) {
@@ -57,7 +57,7 @@ function buildOverdueReminders() {
           const mentions=[];
           unpaid.forEach(m=>{
             const unpaidItems=m.items.filter(it=>!it.paid.service);
-            const sum=unpaidItems.reduce((s,it)=>{const f=getItemFee(e,it.price,it.note);return s+(f!=null?f*it.qty:0);},0);
+            const sum=unpaidItems.reduce((s,it)=>{const f=getEffectiveFee(e,it);return s+(f!=null?f*it.qty:0);},0);
             text+='@'+m.name+' '+unpaidItems.length+'筆未繳 共'+money(sum)+'\n';
             mentions.push({userId:m.userId,name:m.name});
           });

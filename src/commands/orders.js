@@ -1,6 +1,6 @@
 'use strict';
 const store=require('../store');
-const {daysUntil,money,calcTicketCost,totalQty,getItemFee,LINE,DLINE}=require('../helpers');
+const {daysUntil,money,calcTicketCost,totalQty,getItemFee,getEffectiveFee,LINE,DLINE}=require('../helpers');
 
 /** 確保 items 是陣列 + 每個 item 有 paid + 清理 NaN */
 function ensureArray(rec) {
@@ -28,10 +28,11 @@ function order(userId,userName,args) {
   if (!store.data.orders[id]) store.data.orders[id]={};
   if (!store.data.orders[id][userId]) store.data.orders[id][userId]={name:userName,items:[]};
   const rec=store.data.orders[id][userId]; ensureArray(rec); rec.name=userName;
-  // 每次下單都建一筆新項目（不合併），方便分開追蹤繳費
-  rec.items.push({price,qty,note,paid:{ticket:false,service:false}});
+  // 每次下單都建一筆新項目，並鎖定當時的服務費
+  const sfFee=getItemFee(e,price,note); // 可能為 null（尚未設定）
+  rec.items.push({price,qty,note,paid:{ticket:false,service:false},lockedFee:sfFee});
   store.save();
-  const tc=(price+e.tixFee)*qty,sfFee=getItemFee(e,price,note),locked=d<=3;
+  const tc=(price+e.tixFee)*qty,locked=d<=3;
   return ['✅ 登記成功！',DLINE,'👤 '+userName,'🎵 '+e.name+' - '+e.session,
     '💰 '+money(price)+' × '+qty+'張'+(note?'（'+note+'）':''),
     '🧾 票款：'+money(tc)+'（含拓元'+money(e.tixFee)+'/張）',
@@ -68,9 +69,8 @@ function proxyOrder(isAdmin,args) {
   if (!store.data.orders[id]) store.data.orders[id]={};
   if (!store.data.orders[id][pid]) store.data.orders[id][pid]={name:name+'（代登記）',items:[]};
   const rec=store.data.orders[id][pid];
-  rec.items.push({price,qty,note,paid:{ticket:false,service:false}});
+  const sfFee=getItemFee(e,price,note);rec.items.push({price,qty,note,paid:{ticket:false,service:false},lockedFee:sfFee});
   store.save();
-  const sfFee=getItemFee(e,price,note);
   return ['✅ 已代「'+name+'」登記','🎵 #'+id+' '+e.name,'💰 '+money(price)+'×'+qty+(note?'（'+note+'）':''),
     sfFee!=null?'💼 服務費：'+money(sfFee*qty):''].filter(Boolean).join('\n');
 }
@@ -106,7 +106,7 @@ function myOrders(userId,userName) {
     const locked=daysUntil(e.grabDate)<=3;
     msg+='#'+e.id+' '+e.name+'-'+e.session+(locked?' 🔒':'')+'\n';
     rec.items.forEach((it,i)=>{
-      const fee=getItemFee(e,it.price,it.note);
+      const fee=getEffectiveFee(e,it);
       const tc=(it.price+e.tixFee)*it.qty;
       msg+='  '+(i+1)+'. '+money(it.price)+'×'+it.qty+(it.note?'（'+it.note+'）':'')+'\n';
       msg+='     票款'+money(tc)+' '+(it.paid.ticket?'✅':'⬜')+'｜服務費'+(fee!=null?money(fee*it.qty):'?')+' '+(it.paid.service?'✅':'⬜')+'\n';
@@ -127,7 +127,7 @@ function summary(isAdmin,args) {
     const tot=totalQty(r.items);grand+=tot;
     msg+='👤 '+r.name+'（'+tot+'張）\n';
     r.items.forEach(it=>{
-      const fee=getItemFee(e,it.price,it.note);
+      const fee=getEffectiveFee(e,it);
       msg+='  '+money(it.price)+'×'+it.qty+(it.note?'（'+it.note+'）':'')
         +' 票款'+(it.paid.ticket?'✅':'⬜')+'/'+(fee!=null?'服務費'+money(fee*it.qty):'服務費?')+(it.paid.service?'✅':'⬜')+'\n';
     });

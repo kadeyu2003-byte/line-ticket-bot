@@ -21,6 +21,7 @@ function route(ctx) {
     case '查服務費': return payments.viewServiceFee(args);
     case '設定手續費': return payments.setTixFee(userId,isOwner,args);
     case '查繳費': return payments.paymentStatus(isOwner,args);
+    case '鎖定服務費': return payments.lockFees(isOwner,args);
     case '登記繳費': return payments.markPayment(isOwner,args,true);
     case '取消繳費': return payments.markPayment(isOwner,args,false);
     case '加白名單': return lists.add(isAdmin,'white',args);

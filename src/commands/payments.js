@@ -1,6 +1,6 @@
 'use strict';
 const store=require('../store');
-const {money,getItemFee,LINE,DLINE}=require('../helpers');
+const {money,getItemFee,getEffectiveFee,LINE,DLINE}=require('../helpers');
 const {ensureArray}=require('./orders');
 
 function setServiceFee(isOwner,args) {
@@ -17,8 +17,50 @@ function setServiceFee(isOwner,args) {
     else {const f=Number(a);if(!(f>=0))return '❌ 金額錯誤：'+a;conds['一般']=f;}
   }
   for (const p of prices) {e.serviceFee[p]={...(typeof e.serviceFee[p]==='object'?e.serviceFee[p]:{}),...conds};}
+  // 自動填入尚未鎖定的訂單（lockedFee === null 的）
+  const filled=autoFillNulls(e);
   store.save();
-  return renderSF(e,'✅ 服務費已更新');
+  let msg=renderSF(e,'✅ 服務費已更新');
+  if (filled>0) msg+='\n📌 已自動套用到 '+filled+' 筆尚未鎖定的訂單';
+  msg+='\n💡 改費率前請先用「鎖定服務費 '+e.id+'」鎖住現有訂單';
+  return msg;
+}
+
+/** 自動填入 lockedFee === null 的項目，回傳填了幾筆 */
+function autoFillNulls(e) {
+  const orders=store.data.orders[e.id]||{};
+  let count=0;
+  for (const rec of Object.values(orders)) {
+    if (!Array.isArray(rec.items)) continue;
+    for (const it of rec.items) {
+      if (it.lockedFee==null) {
+        const fee=getItemFee(e,it.price,it.note);
+        if (fee!=null) {it.lockedFee=fee;count++;}
+      }
+    }
+  }
+  return count;
+}
+
+/** 鎖定服務費：把所有 null 的 lockedFee 填入當前費率（改費率前用） */
+function lockFees(isOwner,args) {
+  if (!isOwner) return '⛔ 僅限主管理員。';
+  if (!args[0]) return '❌ 格式：鎖定服務費 [場次編號]';
+  const id=Number(args[0]),e=store.data.events[id];
+  if (!e) return '❌ 找不到場次。';
+  const filled=autoFillNulls(e);
+  // 也鎖住那些有 lockedFee 的（不動它們）
+  const orders=store.data.orders[e.id]||{};
+  let total=0,locked=0;
+  for (const rec of Object.values(orders)) {
+    if (!Array.isArray(rec.items)) continue;
+    for (const it of rec.items) {total++;if(it.lockedFee!=null)locked++;}
+  }
+  store.save();
+  return ['✅ 服務費鎖定完成 #'+e.id,
+    '📊 共 '+total+' 筆訂單，'+locked+' 筆已鎖定'+(filled>0?'（本次新鎖 '+filled+' 筆）':''),
+    '','📌 現在可以安心改費率了，舊訂單不會被影響。',
+    '例如改清票費率：設定服務費 '+e.id+' 7880 一般:1500'].join('\n');
 }
 function renderSF(e,title) {
   const sf=e.serviceFee||{},l=[title,'🎵 #'+e.id+' '+e.name,LINE];
@@ -59,7 +101,7 @@ function paymentStatus(isOwner,args) {
   let curName='';
   for (const a of allItems) {
     if (a.name!==curName) {curName=a.name; msg+='👤 '+a.name+'\n';}
-    const fee=getItemFee(e,a.item.price,a.item.note);
+    const fee=getEffectiveFee(e,a.item);
     const tc=(a.item.price+e.tixFee)*a.item.qty;
     msg+='  '+a.seq+'. '+money(a.item.price)+'×'+a.item.qty+(a.item.note?'（'+a.item.note+'）':'')+'\n';
     msg+='     票款'+money(tc)+' '+(a.item.paid.ticket?'✅':'⬜')+'｜服務費'+(fee!=null?money(fee*a.item.qty):'?')+' '+(a.item.paid.service?'✅':'⬜')+'\n';
@@ -98,4 +140,4 @@ function markPayment(isOwner,args,markPaid) {
     +label+'→'+(markPaid?'已繳✅':'未繳⬜');
 }
 
-module.exports={setServiceFee,viewServiceFee,setTixFee,paymentStatus,markPayment};
+module.exports={setServiceFee,viewServiceFee,setTixFee,paymentStatus,markPayment,lockFees};

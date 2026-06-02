@@ -69,12 +69,12 @@ function getItemFee(event, price, note) {
   return tier['一般'] ?? null;
 }
 
-/** 計算整筆訂單的服務費 */
+/** 計算整筆訂單的服務費（優先用鎖定費率） */
 function calcServiceFee(event, items) {
   let total = 0, isSet = false;
   const missing = [];
   for (const it of items) {
-    const fee = getItemFee(event, it.price, it.note);
+    const fee = (it.lockedFee != null) ? it.lockedFee : getItemFee(event, it.price, it.note);
     if (fee != null) { isSet = true; total += fee * it.qty; }
     else missing.push(it.price);
   }
@@ -108,8 +108,14 @@ function serviceFeeSummary(event) {
   return parts.join('｜') || '（尚未設定）';
 }
 
+/** 取得某項目的有效服務費（優先用鎖定費率，沒有才查當前設定） */
+function getEffectiveFee(event, item) {
+  if (item.lockedFee != null) return item.lockedFee;
+  return getItemFee(event, item.price, item.note);
+}
+
 module.exports = {
   TZ, nowTW, todayStr, toDateStr, dayDiff, daysUntil, addDays, isValidDate,
   isLastDayOfMonth, money, LINE, DLINE,
-  getItemFee, calcServiceFee, calcTicketCost, totalQty, serviceFeeSummary,
+  getItemFee, getEffectiveFee, calcServiceFee, calcTicketCost, totalQty, serviceFeeSummary,
 };
